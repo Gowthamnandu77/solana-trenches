@@ -1,0 +1,19 @@
+skip_local_validator = true
+
+[toolchain]
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+solana_trenches = "FA4U6fpdyYZPqYwnBv9NQWPu8Q53LTjG1iMr3HUtCw7d"
+
+[provider]
+cluster = "devnet"
+wallet = "~/.config/solana/devnet-dev-wallet.json"
+
+[scripts]
+test = "cargo test"
+
+[hooks]
