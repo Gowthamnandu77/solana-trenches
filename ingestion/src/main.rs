@@ -1,5 +1,6 @@
 mod config;
 mod dedup;
+mod events;
 mod fetcher;
 mod freshness;
 mod listener;
@@ -31,7 +32,7 @@ type Error = Box<dyn std::error::Error>;
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let config = config::load_config()?;
-    println!("Solana Trenches — Raydium New Pool Momentum Tracker V13 (READ ONLY)");
+    println!("Solana Trenches — Multi-Protocol Solana Launch Tracker V14 (READ ONLY)");
     println!("Cluster: {}", config.cluster);
     // Manifest-relative path is stable whether run from the workspace or ingestion.
     let mut files = Persistence::open(&Path::new(env!("CARGO_MANIFEST_DIR")).join("data")).await?;
@@ -51,6 +52,15 @@ async fn main() -> Result<(), Error> {
             config.ws_url.clone(),
             program,
             label,
+            sender.clone(),
+            metrics.clone(),
+        ));
+    }
+    if let Some(program) = config.launchlab_program {
+        tasks.spawn(listener::run_listener(
+            config.ws_url.clone(),
+            program,
+            "raydium_launchlab",
             sender.clone(),
             metrics.clone(),
         ));
@@ -155,19 +165,19 @@ async fn process(
         &fetched.transaction,
         config.cpmm_program,
         config.clmm_program,
+        config.launchlab_program,
     );
     let pools = raydium::detect_new_pools(
         &fetched.transaction,
         config.cpmm_program,
         config.clmm_program,
+        config.launchlab_program,
     );
     metrics
         .decode_latency
         .observe(decode_start.elapsed().as_millis() as u64);
     let payer = raydium::fee_payer(&fetched.transaction);
     let source_invoked = raydium::program_invoked_in_logs(&log.logs, log.program_id);
-    let cpmm_present = records.iter().any(|r| r.protocol == "raydium_cpmm");
-    let clmm_present = records.iter().any(|r| r.protocol == "raydium_clmm");
     let status = if records.iter().any(|r| r.known) {
         "decoded"
     } else if source_invoked || !records.is_empty() {
@@ -190,31 +200,38 @@ async fn process(
     let timestamp = Utc::now().to_rfc3339();
     for record in records.iter().filter(|r| !r.known) {
         files.write(Stream::Unknown, &json!({
-            "schema_version": 13, "timestamp": timestamp, "cluster": config.cluster,
+            "schema_version": 14, "timestamp": timestamp, "cluster": config.cluster,
             "slot": fetched.slot, "signature": log.signature, "source": log.source,
             "protocol": record.protocol, "name": record.name, "discriminator": record.discriminator,
             "source_invoked": source_invoked
         })).await?;
     }
-    files.write(Stream::Events, &json!({
-        "schema_version": 13, "timestamp": timestamp, "cluster": config.cluster,
-        "block_time": fetched.block_time, "slot": fetched.slot, "notification_slot": log.slot,
-        "signature": log.signature, "source": log.source, "source_invoked": source_invoked,
-        "source_invoke_count": raydium::program_invoke_count(&log.logs, log.program_id),
-        "classification_status": status, "instructions": names,
-        "cpmm_present": cpmm_present, "clmm_present": clmm_present,
-        "multi_protocol_route": cpmm_present && clmm_present,
-        "unknown_instruction_count": records.iter().filter(|r| !r.known).count(),
-        "new_pool": !pools.is_empty(), "fee_payer": payer,
-        "notification_received_unix_ms": log.received_unix_ms,
-        "fetch_started_unix_ms": fetched.fetch_started_unix_ms,
-        "fetch_completed_unix_ms": fetched.fetch_completed_unix_ms,
-        "decoder_completed_unix_ms": Utc::now().timestamp_millis(),
-        "stale_before_momentum": stale,
-        "stale_reason": stale_reason,
-        "block_time_age_ms": block_age_ms,
-        "notification_to_processing_seconds": log.received_at.elapsed().as_secs_f64()
-    })).await?;
+    for record in records.iter().filter(|r| r.known) {
+        let pool = pools.iter().find(|p| {
+            p.protocol == record.protocol
+                && matches!(record.event_type, "launch_created" | "pool_created")
+        });
+        let event = events::LaunchEvent::from_record(
+            record,
+            pool,
+            events::EventContext {
+                signature: log.signature.clone(),
+                slot: fetched.slot,
+                notification_slot: log.slot,
+                block_time: fetched.block_time,
+                detected_at: timestamp.clone(),
+                processing_lag_ms: local_age_ms,
+                source_program: log.program_id,
+                notification_received_unix_ms: log.received_unix_ms,
+                fetch_started_unix_ms: fetched.fetch_started_unix_ms,
+                fetch_completed_unix_ms: fetched.fetch_completed_unix_ms,
+                source_invoke_count: raydium::program_invoke_count(&log.logs, log.program_id),
+            },
+        );
+        files
+            .write(Stream::Events, &event.to_value(&config.cluster))
+            .await?;
+    }
     for pool in pools {
         let registered = !stale
             && tracker.register(
@@ -226,10 +243,11 @@ async fn process(
                 observed_now,
             );
         files.write(Stream::Pools, &json!({
-            "schema_version": 13, "detected_at": timestamp, "cluster": config.cluster,
+            "schema_version": 14, "detected_at": timestamp, "cluster": config.cluster,
             "block_time": fetched.block_time, "slot": fetched.slot, "signature": log.signature,
             "protocol": pool.protocol, "instruction": pool.instruction, "pool_state": pool.pool_state,
             "token_mint_0": pool.token_mint_0, "token_mint_1": pool.token_mint_1,
+            "creator": pool.creator,
             "tracker_registered": registered, "tracker_rejected_pools_total": tracker.rejected_pools
         })).await?;
         println!(
@@ -247,7 +265,8 @@ async fn process(
     println!(
         "[{}] status={status} instructions={names:?} multi_route={}",
         log.source,
-        cpmm_present && clmm_present
+        records.iter().any(|r| r.protocol == "raydium_cpmm")
+            && records.iter().any(|r| r.protocol == "raydium_clmm")
     );
     Ok(())
 }
@@ -270,6 +289,7 @@ mod tests {
             ws_url: String::new(),
             cpmm_program: "cp",
             clmm_program: "cl",
+            launchlab_program: None,
         };
         let transaction = json!({"transaction":{"message":{"instructions":[{
             "programId":"cl", "data":bs58::encode([233,146,209,142,207,104,64,188]).into_string(),
@@ -323,6 +343,7 @@ mod tests {
             ws_url: String::new(),
             cpmm_program: "cp",
             clmm_program: "cl",
+            launchlab_program: None,
         };
         let ix = |program: &str, disc: [u8; 8], accounts: Vec<&str>| {
             json!({
@@ -374,12 +395,12 @@ mod tests {
         files.flush().await.unwrap();
         drop(files);
         for (name, expected) in [
-            ("raydium_events", 1),
-            ("new_pairs", 1),
+            ("launch_events", 2),
+            ("new_launches", 1),
             ("unknown_instructions", 1),
             ("momentum_snapshots", 3),
         ] {
-            let data = tokio::fs::read_to_string(dir.join(format!("{name}_v13.jsonl")))
+            let data = tokio::fs::read_to_string(dir.join(format!("{name}_v14.jsonl")))
                 .await
                 .unwrap();
             assert!(data.ends_with('\n'));
@@ -394,8 +415,9 @@ mod tests {
                 assert_eq!(rows[0]["creation_slot"], 42);
                 assert_eq!(rows[2]["complete"], true);
             }
-            if name == "raydium_events" {
-                assert_eq!(rows[0]["multi_protocol_route"], true);
+            if name == "launch_events" {
+                assert_eq!(rows[0]["event_type"], "pool_created");
+                assert_eq!(rows[0]["protocol"], "raydium_clmm");
             }
         }
         tokio::fs::remove_dir_all(dir).await.unwrap();
@@ -410,7 +432,7 @@ async fn report_metrics(
     let mut value = metrics.snapshot();
     value["timestamp"] = json!(Utc::now().to_rfc3339());
     value["elapsed_seconds"] = json!(seconds);
-    value["schema_version"] = json!(13);
+    value["schema_version"] = json!(14);
     println!("METRICS {value}");
     files.write(Stream::Metrics, &value).await?;
     Ok(())

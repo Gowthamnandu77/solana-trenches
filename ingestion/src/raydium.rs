@@ -31,12 +31,21 @@ const CLMM_DECREASE_LIQUIDITY_V2: [u8; 8] = [58, 127, 188, 62, 79, 82, 196, 96];
 
 const CLMM_OPEN_POSITION_V2: [u8; 8] = [77, 184, 74, 214, 112, 86, 241, 199];
 
+// Raydium SDK V2 launchpad/instrument.ts (official source).
+const LAUNCHLAB_INITIALIZE_V2: [u8; 8] = [67, 153, 175, 39, 218, 16, 38, 32];
+const LAUNCHLAB_INITIALIZE_TOKEN_2022: [u8; 8] = [37, 190, 126, 222, 44, 154, 171, 17];
+const LAUNCHLAB_BUY_EXACT_IN: [u8; 8] = [250, 234, 13, 123, 213, 156, 19, 236];
+const LAUNCHLAB_BUY_EXACT_OUT: [u8; 8] = [24, 211, 116, 40, 105, 3, 153, 56];
+const LAUNCHLAB_SELL_EXACT_IN: [u8; 8] = [149, 39, 222, 155, 211, 124, 152, 26];
+const LAUNCHLAB_SELL_EXACT_OUT: [u8; 8] = [95, 200, 71, 34, 8, 9, 11, 166];
+
 #[derive(Debug, Clone)]
 pub struct InstructionRecord {
     pub protocol: &'static str,
     pub name: String,
     pub discriminator: String,
     pub known: bool,
+    pub event_type: &'static str,
 }
 
 // ============================================================
@@ -50,6 +59,7 @@ pub struct NewPoolInfo {
     pub pool_state: String,
     pub token_mint_0: String,
     pub token_mint_1: String,
+    pub creator: Option<String>,
 }
 
 pub fn program_invoked_in_logs(logs: &[String], program_id: &str) -> bool {
@@ -113,6 +123,7 @@ fn classify_raw_instruction(
     instruction: &Value,
     cpmm_program: &str,
     clmm_program: &str,
+    launchlab_program: Option<&str>,
 ) -> Option<InstructionRecord> {
     let program_id = instruction.get("programId")?.as_str()?;
 
@@ -120,6 +131,8 @@ fn classify_raw_instruction(
         "raydium_cpmm"
     } else if program_id == clmm_program {
         "raydium_clmm"
+    } else if launchlab_program == Some(program_id) {
+        "raydium_launchlab"
     } else {
         return None;
     };
@@ -129,14 +142,11 @@ fn classify_raw_instruction(
             protocol,
             name: format!(
                 "{}_no_raw_data",
-                if protocol == "raydium_cpmm" {
-                    "cpmm"
-                } else {
-                    "clmm"
-                }
+                protocol.strip_prefix("raydium_").unwrap_or(protocol)
             ),
             discriminator: String::new(),
             known: false,
+            event_type: "unknown",
         });
     };
 
@@ -145,14 +155,11 @@ fn classify_raw_instruction(
             protocol,
             name: format!(
                 "{}_short_data",
-                if protocol == "raydium_cpmm" {
-                    "cpmm"
-                } else {
-                    "clmm"
-                }
+                protocol.strip_prefix("raydium_").unwrap_or(protocol)
             ),
             discriminator: bytes_to_hex(&decoded),
             known: false,
+            event_type: "unknown",
         });
     }
 
@@ -163,6 +170,40 @@ fn classify_raw_instruction(
     // ========================================================
     // CPMM
     // ========================================================
+
+    if protocol == "raydium_launchlab" {
+        let name = if disc == LAUNCHLAB_INITIALIZE_V2 {
+            Some(("launchlab_initialize_v2", "launch_created"))
+        } else if disc == LAUNCHLAB_INITIALIZE_TOKEN_2022 {
+            Some(("launchlab_initialize_with_token_2022", "launch_created"))
+        } else if disc == LAUNCHLAB_BUY_EXACT_IN {
+            Some(("launchlab_buy_exact_in", "swap"))
+        } else if disc == LAUNCHLAB_BUY_EXACT_OUT {
+            Some(("launchlab_buy_exact_out", "swap"))
+        } else if disc == LAUNCHLAB_SELL_EXACT_IN {
+            Some(("launchlab_sell_exact_in", "swap"))
+        } else if disc == LAUNCHLAB_SELL_EXACT_OUT {
+            Some(("launchlab_sell_exact_out", "swap"))
+        } else {
+            None
+        };
+        if let Some((name, event_type)) = name {
+            return Some(InstructionRecord {
+                protocol,
+                name: name.to_string(),
+                discriminator: hex,
+                known: true,
+                event_type,
+            });
+        }
+        return Some(InstructionRecord {
+            protocol,
+            name: format!("launchlab_unknown_{}", hex),
+            discriminator: hex,
+            known: false,
+            event_type: "unknown",
+        });
+    }
 
     if protocol == "raydium_cpmm" {
         let name = if disc == CPMM_INITIALIZE {
@@ -185,6 +226,13 @@ fn classify_raw_instruction(
                 name: name.to_string(),
                 discriminator: hex,
                 known: true,
+                event_type: if name.contains("initialize") {
+                    "pool_created"
+                } else if name.contains("swap") {
+                    "swap"
+                } else {
+                    "protocol_activity"
+                },
             });
         }
 
@@ -193,6 +241,7 @@ fn classify_raw_instruction(
             name: format!("cpmm_unknown_{}", hex),
             discriminator: hex,
             known: false,
+            event_type: "unknown",
         });
     }
 
@@ -224,6 +273,13 @@ fn classify_raw_instruction(
             name: name.to_string(),
             discriminator: hex,
             known: true,
+            event_type: if name.contains("create") {
+                "pool_created"
+            } else if name.contains("swap") {
+                "swap"
+            } else {
+                "protocol_activity"
+            },
         });
     }
 
@@ -232,6 +288,7 @@ fn classify_raw_instruction(
         name: format!("clmm_unknown_{}", hex),
         discriminator: hex,
         known: false,
+        event_type: "unknown",
     })
 }
 
@@ -243,6 +300,7 @@ pub fn collect_instruction_records(
     tx_json: &Value,
     cpmm_program: &str,
     clmm_program: &str,
+    launchlab_program: Option<&str>,
 ) -> Vec<PoolInstruction> {
     let mut records = Vec::new();
 
@@ -252,7 +310,9 @@ pub fn collect_instruction_records(
         .and_then(Value::as_array)
     {
         for instruction in instructions {
-            if let Some(record) = classify_instruction(instruction, cpmm_program, clmm_program) {
+            if let Some(record) =
+                classify_instruction(instruction, cpmm_program, clmm_program, launchlab_program)
+            {
                 records.push(record);
             }
         }
@@ -269,7 +329,8 @@ pub fn collect_instruction_records(
             };
 
             for instruction in instructions {
-                if let Some(record) = classify_instruction(instruction, cpmm_program, clmm_program)
+                if let Some(record) =
+                    classify_instruction(instruction, cpmm_program, clmm_program, launchlab_program)
                 {
                     records.push(record);
                 }
@@ -288,6 +349,7 @@ pub fn detect_pool_instruction(
     instruction: &Value,
     cpmm_program: &str,
     clmm_program: &str,
+    launchlab_program: Option<&str>,
 ) -> Option<NewPoolInfo> {
     let program_id = instruction.get("programId")?.as_str()?;
 
@@ -298,6 +360,23 @@ pub fn detect_pool_instruction(
     }
 
     let disc = &decoded[..8];
+
+    if launchlab_program == Some(program_id)
+        && (disc == LAUNCHLAB_INITIALIZE_V2 || disc == LAUNCHLAB_INITIALIZE_TOKEN_2022)
+    {
+        return Some(NewPoolInfo {
+            protocol: "raydium_launchlab",
+            instruction: if disc == LAUNCHLAB_INITIALIZE_V2 {
+                "initialize_v2"
+            } else {
+                "initialize_with_token_2022"
+            },
+            pool_state: instruction_account(instruction, 5)?,
+            token_mint_0: instruction_account(instruction, 6)?,
+            token_mint_1: instruction_account(instruction, 7)?,
+            creator: instruction_account(instruction, 1),
+        });
+    }
 
     // CPMM initialize
     if program_id == cpmm_program && disc == CPMM_INITIALIZE {
@@ -311,6 +390,7 @@ pub fn detect_pool_instruction(
             token_mint_0: instruction_account(instruction, 4)?,
 
             token_mint_1: instruction_account(instruction, 5)?,
+            creator: None,
         });
     }
 
@@ -326,6 +406,7 @@ pub fn detect_pool_instruction(
             token_mint_0: instruction_account(instruction, 3)?,
 
             token_mint_1: instruction_account(instruction, 4)?,
+            creator: None,
         });
     }
 
@@ -341,6 +422,7 @@ pub fn detect_pool_instruction(
             token_mint_0: instruction_account(instruction, 3)?,
 
             token_mint_1: instruction_account(instruction, 4)?,
+            creator: None,
         });
     }
 
@@ -363,12 +445,21 @@ impl std::ops::Deref for PoolInstruction {
         &self.record
     }
 }
-fn classify_instruction(ix: &Value, cpmm: &str, clmm: &str) -> Option<PoolInstruction> {
-    let record = classify_raw_instruction(ix, cpmm, clmm)?;
+fn classify_instruction(
+    ix: &Value,
+    cpmm: &str,
+    clmm: &str,
+    launch: Option<&str>,
+) -> Option<PoolInstruction> {
+    let record = classify_raw_instruction(ix, cpmm, clmm, launch)?;
     // Verified against Raydium Swap / SwapSingle / SwapSingleV2 account structs.
     let index = match record.name.as_str() {
         "cpmm_swap_base_input" | "cpmm_swap_base_output" => Some(3),
         "clmm_swap" | "clmm_swap_v2" => Some(2),
+        "launchlab_buy_exact_in"
+        | "launchlab_buy_exact_out"
+        | "launchlab_sell_exact_in"
+        | "launchlab_sell_exact_out" => Some(4),
         _ => None,
     };
     let swap_pool = index.and_then(|i| instruction_account(ix, i));
@@ -405,9 +496,14 @@ pub fn instructions(tx: &Value) -> impl Iterator<Item = &Value> {
                 }),
         )
 }
-pub fn detect_new_pools(tx: &Value, cpmm: &str, clmm: &str) -> Vec<NewPoolInfo> {
+pub fn detect_new_pools(
+    tx: &Value,
+    cpmm: &str,
+    clmm: &str,
+    launch: Option<&str>,
+) -> Vec<NewPoolInfo> {
     instructions(tx)
-        .filter_map(|ix| detect_pool_instruction(ix, cpmm, clmm))
+        .filter_map(|ix| detect_pool_instruction(ix, cpmm, clmm, launch))
         .collect()
 }
 /// JSON-parsed account zero is the fee payer; require explicit signer metadata.
@@ -454,7 +550,7 @@ mod tests {
             ),
             ("cl", CLMM_OPEN_POSITION_V2, "clmm_open_position_v2"),
         ] {
-            let r = classify_instruction(&ix(program, disc, vec![]), "cp", "cl").unwrap();
+            let r = classify_instruction(&ix(program, disc, vec![]), "cp", "cl", None).unwrap();
             assert!(r.known);
             assert_eq!(r.name, name);
         }
@@ -463,7 +559,7 @@ mod tests {
     fn outer_inner_routes_and_precise_swap_pool() {
         let tx = json!({"transaction":{"message":{"instructions":[ix("cp",CPMM_SWAP_BASE_INPUT,vec!["payer","authority","config","poolA"])]}},
             "meta":{"innerInstructions":[{"instructions":[ix("cl",CLMM_SWAP_V2,vec!["payer","config","poolB"])]}]}});
-        let records = collect_instruction_records(&tx, "cp", "cl");
+        let records = collect_instruction_records(&tx, "cp", "cl", None);
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].swap_pool.as_deref(), Some("poolA"));
         assert_eq!(records[1].swap_pool.as_deref(), Some("poolB"));
@@ -472,26 +568,79 @@ mod tests {
     fn multiple_pool_creation_and_missing_accounts() {
         let tx = json!({"transaction":{"message":{"instructions":[ix("cp",CPMM_INITIALIZE,vec!["creator","config","authority","a","m0","m1"])]}},
             "meta":{"innerInstructions":[{"instructions":[ix("cl",CLMM_CREATE_POOL,vec!["creator","config","b","n0","n1"])]}]}});
-        let pools = detect_new_pools(&tx, "cp", "cl");
+        let pools = detect_new_pools(&tx, "cp", "cl", None);
         assert_eq!(pools.len(), 2);
         assert_eq!(pools[0].pool_state, "a");
         assert_eq!(pools[1].token_mint_1, "n1");
-        assert!(detect_pool_instruction(&ix("cp", CPMM_INITIALIZE, vec![]), "cp", "cl").is_none());
+        assert!(
+            detect_pool_instruction(&ix("cp", CPMM_INITIALIZE, vec![]), "cp", "cl", None).is_none()
+        );
     }
     #[test]
     fn malformed_unknown_and_fee_payer_validation() {
         let short = json!({"programId":"cp","data":"1"});
-        assert!(!classify_instruction(&short, "cp", "cl").unwrap().known);
         assert!(
-            !classify_instruction(&ix("cp", [0; 8], vec![]), "cp", "cl")
+            !classify_instruction(&short, "cp", "cl", None)
                 .unwrap()
                 .known
         );
-        assert!(classify_instruction(&ix("other", CLMM_SWAP, vec![]), "cp", "cl").is_none());
+        assert!(
+            !classify_instruction(&ix("cp", [0; 8], vec![]), "cp", "cl", None)
+                .unwrap()
+                .known
+        );
+        assert!(classify_instruction(&ix("other", CLMM_SWAP, vec![]), "cp", "cl", None).is_none());
         let mut tx = json!({"transaction":{"message":{"accountKeys":[{"pubkey":"payer","signer":true,"source":"transaction"}]}}});
         assert_eq!(fee_payer(&tx).as_deref(), Some("payer"));
         tx["transaction"]["message"]["accountKeys"][0]["signer"] = json!(false);
         assert!(fee_payer(&tx).is_none());
         assert!(fee_payer(&json!({})).is_none());
+    }
+
+    #[test]
+    fn verified_launchlab_classification_and_accounts_are_program_scoped() {
+        let launch = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj";
+        let create = ix(
+            launch,
+            LAUNCHLAB_INITIALIZE_V2,
+            vec![
+                "payer", "creator", "config", "platform", "auth", "launch", "base", "quote",
+            ],
+        );
+        let record = classify_instruction(&create, "cp", "cl", Some(launch)).unwrap();
+        assert_eq!(record.protocol, "raydium_launchlab");
+        assert_eq!(record.name, "launchlab_initialize_v2");
+        assert_eq!(record.event_type, "launch_created");
+        let pools = detect_new_pools(
+            &json!({"transaction":{"message":{"instructions":[create]}}}),
+            "cp",
+            "cl",
+            Some(launch),
+        );
+        assert_eq!(pools[0].pool_state, "launch");
+        assert_eq!(pools[0].token_mint_0, "base");
+        assert_eq!(pools[0].token_mint_1, "quote");
+        assert_eq!(pools[0].creator.as_deref(), Some("creator"));
+
+        let buy = ix(
+            launch,
+            LAUNCHLAB_BUY_EXACT_IN,
+            vec!["owner", "auth", "config", "platform", "launch"],
+        );
+        let buy_record = classify_instruction(&buy, "cp", "cl", Some(launch)).unwrap();
+        assert_eq!(buy_record.event_type, "swap");
+        assert_eq!(buy_record.swap_pool.as_deref(), Some("launch"));
+        let collision = ix("cp", LAUNCHLAB_INITIALIZE_V2, vec![]);
+        assert_eq!(
+            classify_instruction(&collision, "cp", "cl", Some(launch))
+                .unwrap()
+                .protocol,
+            "raydium_cpmm"
+        );
+        assert!(
+            !classify_instruction(&ix(launch, [0; 8], vec![]), "cp", "cl", Some(launch))
+                .unwrap()
+                .known
+        );
     }
 }

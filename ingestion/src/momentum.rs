@@ -16,6 +16,7 @@ struct Counts {
     swaps: u64,
     cpmm: u64,
     clmm: u64,
+    launchlab: u64,
     payers: HashSet<String>,
     missing_payers: u64,
 }
@@ -111,8 +112,10 @@ impl Tracker {
             counts.swaps += swaps;
             if pool.info.protocol == "raydium_cpmm" {
                 counts.cpmm += swaps;
-            } else {
+            } else if pool.info.protocol == "raydium_clmm" {
                 counts.clmm += swaps;
+            } else if pool.info.protocol == "raydium_launchlab" {
+                counts.launchlab += swaps;
             }
             if swaps > 0 {
                 if let Some(payer) = payer {
@@ -176,7 +179,7 @@ impl Pool {
             previous.map(|p| (STARTS[i] as f64 + elapsed - (STARTS[p] + ENDS[p]) as f64) / 2.0);
         let payers: HashSet<_> = self.buckets[..=i].iter().flat_map(|c| &c.payers).collect();
         json!({
-            "schema_version": 13, "protocol": self.info.protocol, "pool_state": self.info.pool_state,
+            "schema_version": 14, "protocol": self.info.protocol, "launch_account": self.info.pool_state, "pool_state": self.info.pool_state,
             "token_mint_0": self.info.token_mint_0, "token_mint_1": self.info.token_mint_1,
             "creation_signature": self.signature, "creation_slot": self.slot,
             "creation_timestamp": self.block_time, "detected_at": self.detected_at,
@@ -184,7 +187,7 @@ impl Pool {
             "interval_start_seconds": STARTS[i], "interval_end_seconds": elapsed,
             "complete": complete, "end_reason": if complete { "window_elapsed" } else { "shutdown" },
             "tx_count": counts.tx, "raydium_invocation_count": counts.invocations,
-            "swap_count": counts.swaps, "cpmm_swap_count": counts.cpmm, "clmm_swap_count": counts.clmm,
+            "swap_count": counts.swaps, "cpmm_swap_count": counts.cpmm, "clmm_swap_count": counts.clmm, "launchlab_swap_count": counts.launchlab,
             "unique_traders": counts.payers.len() as u64, "trader_metric": "distinct_swap_transaction_fee_payers",
             "swap_transactions_without_fee_payer": counts.missing_payers,
             "tx_per_second": tx_rate, "swaps_per_second": swap_rate,
@@ -212,6 +215,7 @@ mod tests {
             pool_state: address.into(),
             token_mint_0: "mint0".into(),
             token_mint_1: "mint1".into(),
+            creator: None,
         }
     }
     fn record(address: &str, swap: bool) -> PoolInstruction {
@@ -221,6 +225,7 @@ mod tests {
                 name: "synthetic".into(),
                 discriminator: "".into(),
                 known: true,
+                event_type: "swap",
             },
             accounts: vec![address.into()],
             swap_pool: swap.then(|| address.into()),
@@ -228,6 +233,80 @@ mod tests {
     }
     fn register(t: &mut Tracker, address: &str, now: f64) -> bool {
         t.register(pool(address), "creation", 1, Some(123), "test", now)
+    }
+
+    #[test]
+    fn tracks_launchlab_and_clmm_separately() {
+        let mut t = Tracker::default();
+        t.register(
+            NewPoolInfo {
+                protocol: "raydium_launchlab",
+                instruction: "initialize_v2",
+                pool_state: "launch".into(),
+                token_mint_0: "base".into(),
+                token_mint_1: "quote".into(),
+                creator: None,
+            },
+            "launch-create",
+            1,
+            None,
+            "test",
+            0.0,
+        );
+        t.register(
+            NewPoolInfo {
+                protocol: "raydium_clmm",
+                instruction: "create_pool",
+                pool_state: "pool".into(),
+                token_mint_0: "base".into(),
+                token_mint_1: "quote".into(),
+                creator: None,
+            },
+            "pool-create",
+            2,
+            None,
+            "test",
+            0.0,
+        );
+        let launch_record = PoolInstruction {
+            record: InstructionRecord {
+                protocol: "raydium_launchlab",
+                name: "launchlab_buy_exact_in".into(),
+                discriminator: "".into(),
+                known: true,
+                event_type: "swap",
+            },
+            accounts: vec!["launch".into()],
+            swap_pool: Some("launch".into()),
+        };
+        let clmm_record = PoolInstruction {
+            record: InstructionRecord {
+                protocol: "raydium_clmm",
+                name: "clmm_swap".into(),
+                discriminator: "".into(),
+                known: true,
+                event_type: "swap",
+            },
+            accounts: vec!["pool".into()],
+            swap_pool: Some("pool".into()),
+        };
+        t.observe("launch-swap", Some("a"), &[launch_record], 1.0);
+        t.observe("clmm-swap", Some("b"), &[clmm_record], 1.0);
+        let snapshots = t.advance(10.0);
+        assert_eq!(
+            snapshots
+                .iter()
+                .find(|s| s["protocol"] == "raydium_launchlab")
+                .unwrap()["launchlab_swap_count"],
+            1
+        );
+        assert_eq!(
+            snapshots
+                .iter()
+                .find(|s| s["protocol"] == "raydium_clmm")
+                .unwrap()["clmm_swap_count"],
+            1
+        );
     }
     #[test]
     fn windows_dedup_swaps_payers_acceleration_and_score() {

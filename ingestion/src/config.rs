@@ -3,6 +3,7 @@ use std::env;
 const MAINNET_CPMM: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 
 const MAINNET_CLMM: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
+const MAINNET_LAUNCHLAB: &str = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj";
 
 const DEVNET_CPMM: &str = "DRaycpLY18LhpbydsBWbVJtxpNv9oXPgjRSfpF2bWpYb";
 
@@ -20,6 +21,7 @@ pub struct Config {
     pub ws_url: String,
     pub cpmm_program: &'static str,
     pub clmm_program: &'static str,
+    pub launchlab_program: Option<&'static str>,
 }
 
 pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
@@ -78,6 +80,7 @@ pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
         ws_url,
         cpmm_program,
         clmm_program,
+        launchlab_program: mainnet.then_some(MAINNET_LAUNCHLAB),
     })
 }
 

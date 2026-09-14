@@ -2,7 +2,7 @@
 
 A Rust/Solana engineering and market-intelligence project. The repository contains an Anchor program under `programs/` and a separate read-only ingestion application under `ingestion/`.
 
-## Raydium New Pool Momentum Tracker — V12
+## Multi-Protocol Solana Launch Tracker — V14
 
 Targeted Solana WebSocket subscriptions watch Raydium CPMM and CLMM program mentions. An async Rust pipeline fetches successful confirmed transactions, decodes outer and inner Raydium instructions, detects pool creation, and tracks newly observed pools concurrently. V10 program IDs, discriminator mappings, protocol classifications, unknown-instruction discovery, and route detection are retained.
 
@@ -224,3 +224,45 @@ and flushed valid JSONL.
 
 No new pool appeared in this sample. The final record reported eight cancelled
 jobs during shutdown; current jobs and active HTTP concurrency returned to zero.
+
+## V14 supported protocols and normalized events
+
+V14 retains the verified Raydium CPMM and CLMM decoders and adds Raydium
+LaunchLab on Mainnet. The LaunchLab listener uses program ID
+`LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj`. V14 writes normalized records to
+`launch_events_v14.jsonl`, launch and pool records to `new_launches_v14.jsonl`,
+unknown records to `unknown_instructions_v14.jsonl`, and the existing momentum
+and runtime streams with the V14 suffix. These runtime files remain ignored by
+Git.
+
+Each normalized `LaunchEvent` contains `protocol`, `event_type`, signature, slot,
+block time, local detection time, processing lag, launch or pool account, base
+and quote mints when the verified instruction account order supplies them,
+creator when the instruction supplies it reliably, source program, instruction
+name, and decode status. Reliable event types currently emitted are
+`launch_created` for LaunchLab initialization, `pool_created` for CPMM/CLMM pool
+creation, and `swap` for the supported CPMM, CLMM, and LaunchLab swap
+instructions. The tracker keys state by the normalized launch or pool account
+and keeps the 10/30/60-second local observation windows for every supported
+protocol.
+
+LaunchLab details were verified against Raydium's official
+[raydium-sdk-V2 launchpad instrument source](https://github.com/raydium-io/raydium-sdk-V2/blob/master/src/raydium/launchpad/instrument.ts),
+including the discriminators and account order for `initializeV2`,
+`initializeWithToken2022`, `buyExactIn`, `buyExactOut`, `sellExactIn`, and
+`sellExactOut`. The official [launchpad layout source](https://github.com/raydium-io/raydium-sdk-V2/blob/master/src/raydium/launchpad/layout.ts)
+was used to confirm the launch pool fields and mint ordering. Raydium's
+[LaunchLab examples](https://github.com/raydium-io/raydium-sdk-V2-demo/tree/master/src/launchpad)
+confirm the production program selection. Existing CPMM/CLMM mappings remain
+anchored to Raydium's official program repositories linked above.
+
+The scanner does not claim full Solana launch coverage. It does not decode
+Raydium AMM v4, Orca, Meteora, Pump.fun, PumpSwap, or other protocols. LaunchLab
+devnet support is disabled because this repository has not verified a devnet
+program ID from an official Raydium source. LaunchLab migration, vesting,
+platform configuration, liquidity management, and event-log payload decoding
+remain unsupported. Trade mint pairs and creators are left null when they are
+not present in the verified instruction account order; the scanner does not
+infer them from arbitrary transaction accounts. V14 still observes confirmed
+notifications without historical backfill, fork reconciliation, or unlimited
+reordering, and V13 freshness limits can discard delayed work.
