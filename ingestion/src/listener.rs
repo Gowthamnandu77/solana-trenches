@@ -1,16 +1,16 @@
-use crate::metrics::Metrics;
+use crate::{
+    metrics::Metrics,
+    queue::{FreshQueue, PushResult},
+};
 use futures_util::StreamExt;
 use solana_client::{
     nonblocking::pubsub_client::PubsubClient,
     rpc_config::{CommitmentConfig, RpcTransactionLogsConfig, RpcTransactionLogsFilter},
 };
 use std::sync::{atomic::Ordering::Relaxed, Arc};
-use tokio::{
-    sync::mpsc,
-    time::{sleep, timeout, Duration, Instant},
-};
+use tokio::time::{sleep, timeout, Duration, Instant};
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct LogEvent {
     pub source: &'static str,
     pub program_id: &'static str,
@@ -26,7 +26,7 @@ pub async fn run_listener(
     ws_url: String,
     program_id: &'static str,
     label: &'static str,
-    sender: mpsc::Sender<LogEvent>,
+    sender: Arc<FreshQueue>,
     metrics: Arc<Metrics>,
 ) {
     let mut backoff = 3;
@@ -68,22 +68,26 @@ pub async fn run_listener(
                     };
                     // Drop with a visible counter instead of silently stalling the socket forever.
                     let signature = event.signature.clone();
-                    let mut queued = metrics.queued.lock().unwrap();
-                    queued.insert(signature.clone(), event.received_at);
-                    match sender.try_send(event) {
-                        Ok(()) => {
-                            metrics.queue_high_water.fetch_max(
-                                (sender.max_capacity() - sender.capacity()) as u64,
-                                Relaxed,
-                            );
+                    let received_at = event.received_at;
+                    match sender.push(event) {
+                        PushResult::Accepted { evicted } => {
+                            let mut queued = metrics.queued.lock().unwrap();
+                            queued.insert(signature, received_at);
+                            for old in evicted {
+                                queued.remove(&old.signature);
+                                metrics.stale_evicted_before_queue.fetch_add(1, Relaxed);
+                            }
+                            metrics.fresh_candidates_admitted.fetch_add(1, Relaxed);
+                            metrics
+                                .queue_high_water
+                                .fetch_max(sender.len() as u64, Relaxed);
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => return,
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            queued.remove(&signature);
+                        PushResult::Closed => return,
+                        PushResult::Full => {
                             metrics.notifications_dropped.fetch_add(1, Relaxed);
                             metrics
                                 .queue_high_water
-                                .fetch_max(sender.max_capacity() as u64, Relaxed);
+                                .fetch_max(sender.len() as u64, Relaxed);
                             DROPPED_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     }

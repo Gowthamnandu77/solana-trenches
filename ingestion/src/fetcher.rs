@@ -3,6 +3,7 @@ use crate::{
     dedup::remember_signature,
     listener::LogEvent,
     metrics::{AttemptGuard, JobGuard, Metrics},
+    queue::FreshQueue,
     rpc::{FetchError, HttpTransport, Transport},
 };
 use futures_util::{stream::FuturesUnordered, StreamExt};
@@ -63,7 +64,7 @@ impl RequestGate {
 
 pub async fn run(
     config: Config,
-    input: mpsc::Receiver<LogEvent>,
+    input: Arc<FreshQueue>,
     output: mpsc::Sender<FetchedEvent>,
     metrics: Arc<Metrics>,
 ) {
@@ -90,7 +91,7 @@ pub async fn run(
 /// Dropping this future cancels every child future synchronously.
 async fn dispatch<T: Transport>(
     rpc: Arc<T>,
-    mut input: mpsc::Receiver<LogEvent>,
+    input: Arc<FreshQueue>,
     output: mpsc::Sender<FetchedEvent>,
     limit: usize,
     spacing: Duration,
@@ -98,7 +99,8 @@ async fn dispatch<T: Transport>(
 ) {
     assert!((1..=64).contains(&limit));
     let gate = Arc::new(RequestGate::new(spacing));
-    let (mut seen, mut queue, mut pending) = (HashSet::new(), VecDeque::new(), HashSet::new());
+    let (mut seen, mut dedup_queue, mut pending) =
+        (HashSet::new(), VecDeque::new(), HashSet::new());
     let mut jobs = FuturesUnordered::new();
     let mut input_closed = false;
     loop {
@@ -116,9 +118,10 @@ async fn dispatch<T: Transport>(
                 let max_age = metrics.max_fetch_age_ms.load(Relaxed);
                 if max_age > 0 && log.received_at.elapsed().as_millis() > max_age as u128 {
                     metrics.stale_before_fetch.fetch_add(1, Relaxed);
+                    metrics.stale_discarded_from_queue.fetch_add(1, Relaxed);
                     continue;
                 }
-                if pending.contains(&log.signature) || !remember_signature(&log.signature, &mut seen, &mut queue) {
+                if pending.contains(&log.signature) || !remember_signature(&log.signature, &mut seen, &mut dedup_queue) {
                     metrics.duplicates.fetch_add(1, Relaxed); continue;
                 }
                 if Signature::from_str(&log.signature).is_err() { continue; }
@@ -256,30 +259,73 @@ mod tests {
         let rpc = Arc::new(Mock::new(0, FetchError::Transient, Duration::ZERO));
         let metrics = Arc::new(Metrics::default());
         metrics.max_fetch_age_ms.store(100, Relaxed);
-        let (tx, rx) = mpsc::channel(2);
+        let input = Arc::new(FreshQueue::new(2, 100));
         let (output, mut received) = mpsc::channel(2);
-        tx.send(event(1)).await.unwrap();
+        input.push(event(1));
         tokio::time::advance(Duration::from_millis(101)).await;
-        drop(tx);
-        dispatch(rpc.clone(), rx, output, 1, Duration::ZERO, metrics.clone()).await;
+        input.close();
+        dispatch(
+            rpc.clone(),
+            input,
+            output,
+            1,
+            Duration::ZERO,
+            metrics.clone(),
+        )
+        .await;
         assert!(received.recv().await.is_none());
         assert!(rpc.calls.lock().unwrap().is_empty());
         assert_eq!(metrics.stale_before_fetch.load(Relaxed), 1);
         assert_eq!(metrics.queue_wait.snapshot()["max"], 101);
     }
     #[tokio::test(start_paused = true)]
+    async fn fresh_work_replaces_stale_backlog_and_reaches_rpc() {
+        let rpc = Arc::new(Mock::new(0, FetchError::Transient, Duration::ZERO));
+        let metrics = Arc::new(Metrics::default());
+        metrics.max_fetch_age_ms.store(100, Relaxed);
+        let input = Arc::new(FreshQueue::new(4, 100));
+        for id in 1..=4 {
+            assert!(matches!(
+                input.push(event(id)),
+                crate::queue::PushResult::Accepted { .. }
+            ));
+        }
+        tokio::time::advance(Duration::from_millis(101)).await;
+        let evicted = match input.push(event(9)) {
+            crate::queue::PushResult::Accepted { evicted } => evicted,
+            _ => panic!("stale entries were not evicted"),
+        };
+        input.close();
+        let (output, mut received) = mpsc::channel(1);
+        dispatch(
+            rpc.clone(),
+            input,
+            output,
+            1,
+            Duration::ZERO,
+            metrics.clone(),
+        )
+        .await;
+        assert_eq!(
+            received.recv().await.unwrap().log.signature,
+            event(9).signature
+        );
+        assert_eq!(evicted.len(), 4);
+        assert_eq!(metrics.attempts.load(Relaxed), 1);
+    }
+    #[tokio::test(start_paused = true)]
     async fn bounded_concurrency_duplicates_and_retry_deliver_each_transaction_once() {
         let rpc = Arc::new(Mock::new(1, FetchError::Transient, Duration::from_secs(1)));
         let metrics = Arc::new(Metrics::default());
-        let (tx, rx) = mpsc::channel(8);
+        let input = Arc::new(FreshQueue::new(8, 60_000));
         let (output, mut received) = mpsc::channel(1);
         for id in [1, 2, 1, 3, 4, 2] {
-            tx.send(event(id)).await.unwrap();
+            input.push(event(id));
         }
-        drop(tx);
+        input.close();
         let worker = tokio::spawn(dispatch(
             rpc.clone(),
-            rx,
+            input,
             output,
             3,
             Duration::ZERO,
@@ -311,17 +357,23 @@ mod tests {
             FetchError::Transient,
             Duration::from_secs(3600),
         ));
-        let (tx, rx) = mpsc::channel(2);
+        let input = Arc::new(FreshQueue::new(2, 60_000));
         let (output, mut received) = mpsc::channel(1);
-        tx.try_send(event(1)).unwrap();
-        tx.try_send(event(2)).unwrap();
         assert!(matches!(
-            tx.try_send(event(3)),
-            Err(mpsc::error::TrySendError::Full(_))
+            input.push(event(1)),
+            crate::queue::PushResult::Accepted { .. }
+        ));
+        assert!(matches!(
+            input.push(event(2)),
+            crate::queue::PushResult::Accepted { .. }
+        ));
+        assert!(matches!(
+            input.push(event(3)),
+            crate::queue::PushResult::Full
         ));
         let worker = tokio::spawn(dispatch(
             rpc,
-            rx,
+            input.clone(),
             output,
             2,
             Duration::ZERO,
@@ -331,28 +383,36 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(metrics.current.load(Relaxed), 2);
-        tx.try_send(event(3)).unwrap();
-        tx.try_send(event(4)).unwrap();
+        assert!(matches!(
+            input.push(event(3)),
+            crate::queue::PushResult::Accepted { .. }
+        ));
+        assert!(matches!(
+            input.push(event(4)),
+            crate::queue::PushResult::Accepted { .. }
+        ));
+        input.close();
         worker.abort();
         assert!(worker.await.unwrap_err().is_cancelled());
         assert_eq!(metrics.current.load(Relaxed), 0);
         assert_eq!(metrics.jobs.load(Relaxed), 0);
         assert_eq!(metrics.cancelled.load(Relaxed), 2);
         assert!(received.recv().await.is_none());
-        assert!(tx.is_closed());
+        assert_eq!(input.len(), 2);
     }
     #[tokio::test(start_paused = true)]
     async fn full_output_retains_job_slots_and_cancels_cleanly() {
         let metrics = Arc::new(Metrics::default());
         let rpc = Arc::new(Mock::new(0, FetchError::Transient, Duration::ZERO));
-        let (tx, rx) = mpsc::channel(8);
+        let input = Arc::new(FreshQueue::new(8, 60_000));
         let (output, received) = mpsc::channel(1);
         for id in 1..=8 {
-            tx.send(event(id)).await.unwrap();
+            input.push(event(id));
         }
+        input.close();
         let worker = tokio::spawn(dispatch(
             rpc,
-            rx,
+            input,
             output,
             2,
             Duration::ZERO,
@@ -376,12 +436,12 @@ mod tests {
         ] {
             let metrics = Arc::new(Metrics::default());
             let rpc = Arc::new(Mock::new(usize::MAX, error, Duration::ZERO));
-            let (tx, rx) = mpsc::channel(1);
+            let input = Arc::new(FreshQueue::new(1, 60_000));
             let (output, mut received) = mpsc::channel(1);
-            tx.send(event(1)).await.unwrap();
-            drop(tx);
+            input.push(event(1));
+            input.close();
             let start = Instant::now();
-            dispatch(rpc, rx, output, 1, Duration::ZERO, metrics.clone()).await;
+            dispatch(rpc, input, output, 1, Duration::ZERO, metrics.clone()).await;
             assert!(received.recv().await.is_none());
             assert_eq!(metrics.attempts.load(Relaxed), attempts);
             assert_eq!(metrics.retries.load(Relaxed), attempts - 1);

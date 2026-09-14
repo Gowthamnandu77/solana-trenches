@@ -10,6 +10,9 @@ use tokio::time::Instant;
 pub struct Metrics {
     pub notifications_received: AtomicU64,
     pub stale_before_fetch: AtomicU64,
+    pub stale_evicted_before_queue: AtomicU64,
+    pub stale_discarded_from_queue: AtomicU64,
+    pub fresh_candidates_admitted: AtomicU64,
     pub stale_before_momentum: AtomicU64,
     pub max_fetch_age_ms: AtomicU64,
     pub queue_wait: Histogram,
@@ -56,9 +59,13 @@ impl Metrics {
         json!({
             "notifications_received":get(&self.notifications_received),
             "stale_before_fetch": get(&self.stale_before_fetch),
+            "stale_evicted_before_queue": get(&self.stale_evicted_before_queue),
+            "stale_discarded_from_queue": get(&self.stale_discarded_from_queue),
+            "fresh_candidates_admitted": get(&self.fresh_candidates_admitted),
             "stale_before_momentum": get(&self.stale_before_momentum),
             "queue_occupancy": queued.len(),
             "oldest_queued_age_ms": oldest,
+            "current_queue_age_ms": oldest,
             "queue_wait_ms": self.queue_wait.snapshot(),
             "fetch_start_lag_ms": self.fetch_start_lag.snapshot(),
             "processing_lag_ms": self.processing_lag.snapshot(),

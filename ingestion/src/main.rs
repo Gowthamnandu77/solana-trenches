@@ -8,6 +8,7 @@ mod listener;
 mod metrics;
 mod momentum;
 mod persistence;
+mod queue;
 mod raydium;
 mod rpc;
 
@@ -48,7 +49,10 @@ async fn main() -> Result<(), Error> {
         config.max_fetch_start_age_ms, config.max_momentum_event_age_ms, config.verbose,
         redact_endpoint(&config.http_url), redact_endpoint(&config.ws_url)
     );
-    let (sender, receiver) = mpsc::channel(config.input_queue_capacity);
+    let input = Arc::new(queue::FreshQueue::new(
+        config.input_queue_capacity,
+        config.max_fetch_start_age_ms,
+    ));
     let (fetched_sender, mut fetched_receiver) = mpsc::channel(128);
     let mut tasks = JoinSet::new();
     for (program, label) in [
@@ -59,7 +63,7 @@ async fn main() -> Result<(), Error> {
             config.ws_url.clone(),
             program,
             label,
-            sender.clone(),
+            input.clone(),
             metrics.clone(),
         ));
     }
@@ -68,14 +72,13 @@ async fn main() -> Result<(), Error> {
             config.ws_url.clone(),
             program,
             "raydium_launchlab",
-            sender.clone(),
+            input.clone(),
             metrics.clone(),
         ));
     }
-    drop(sender);
     tasks.spawn(fetcher::run(
         config.clone(),
-        receiver,
+        input.clone(),
         fetched_sender,
         metrics.clone(),
     ));
@@ -109,6 +112,7 @@ async fn main() -> Result<(), Error> {
         }
         Ok(())
     }.await;
+    input.close();
     // Cancelling tasks drops sockets and pending RPC futures. Queued work is
     // deliberately discarded; persisted JSON lines are never cancelled mid-write.
     tasks.abort_all();
