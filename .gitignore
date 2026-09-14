@@ -3,3 +3,12 @@ node_modules/
 .env
 *-wallet.json
 *.keypair.json
+.env.*
+!.env.example
+*.pem
+*.key
+id.json
+wallet.json
+wallets/
+**/data/*.jsonl
+ingestion/data/*.jsonl

@@ -1,5 +1,5 @@
 [workspace]
-members = [
+members = [ "ingestion",
     "programs/*"
 ]
 resolver = "2"
