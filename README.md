@@ -456,3 +456,54 @@ and maximum drawdown is the lowest `return - running peak` in the window. The
 tool reports `complete`, `partial`, or `missing`, while V15 scanner quality flags
 remain separate from price quality. There is no live collection mode yet:
 offline reproducibility and source auditability take priority.
+
+## Phase 2 / P3 — Real Dataset Collection and Evaluation
+
+P3 makes collection progress visible without changing the V15 scanner. Run the
+read-only ingestion process for an extended period with a provider endpoint
+whose rate budget matches the expected traffic. The public Solana RPC is useful
+for smoke tests but should not be assumed to provide complete coverage:
+
+```bash
+cd ingestion
+SOLANA_CLUSTER=mainnet \
+SOLANA_HTTP_URL=https://your-configured-rpc.example \
+SOLANA_WS_URL=wss://your-configured-rpc.example/ \
+FETCH_CONCURRENCY=8 RPC_MIN_REQUEST_INTERVAL_MS=250 \
+cargo run --release
+```
+
+The scanner appends V15 JSONL records under `ingestion/data/`, keeps runtime
+files Git-ignored, bounds queues and fetch concurrency, and flushes output on
+ordinary interruption. Existing runtime files are preserved across restarts.
+The research reader deduplicates launch/pool accounts before evaluation, so
+re-running collection or backfill does not double-count a launch. No wallet or
+signer is needed. Better RPC infrastructure can improve coverage, freshness,
+and the number of complete windows; it cannot be assumed from this workflow.
+
+Inspect progress from the repository root:
+
+```bash
+cargo run -p research -- inventory --features ingestion/data/features_v15.jsonl
+cargo run -p research -- backfill --features ingestion/data/features_v15.jsonl --prices path/prices.csv
+cargo run -p research -- backtest --features ingestion/data/features_v15.jsonl --prices path/prices.csv
+```
+
+`inventory` reports total and unique feature records, protocol counts, complete
+and partial windows, scanner quality flags, usable mint coverage, labeling
+readiness, and labeled/partial/unlabeled counts. `backtest` writes
+`research/data/backtest_report.json`, uses fixed score thresholds of 40, 60,
+and 80, separates clean complete and partial samples from scanner-quality
+rejections, and reports bucket returns, win rate, mean/median return,
+expectancy, drawdown, and correlations. Cost inputs are optional:
+`--fee-per-side 0.003 --slippage-per-side 0.005`; defaults are zero. Net
+returns apply those percentages on both entry and exit and are clearly marked
+as simplified research assumptions.
+
+Interpretation is sample-size dependent: fewer than 30 usable samples are
+exploratory only; 30–100 remain weak evidence; 100 or more support preliminary
+evaluation, not proof. Records are ordered by creation time for future
+chronological threshold exploration and holdout evaluation; random shuffling is
+not used. Current coverage is too small for a holdout or predictive claim.
+Backtest outputs are gross or simplified net results, never profitability
+claims, and do not model realistic execution, MEV, latency, or failed fills.

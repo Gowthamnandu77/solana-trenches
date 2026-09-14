@@ -43,7 +43,7 @@ pub struct Outcome {
     pub missing_data_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LabeledLaunch {
     pub protocol: String,
     pub launch_account: String,
@@ -402,6 +402,24 @@ pub fn write_jsonl(path: &Path, rows: &[LabeledLaunch]) -> io::Result<()> {
     Ok(())
 }
 
+pub fn read_labeled(path: &Path) -> io::Result<Vec<LabeledLaunch>> {
+    let file = File::open(path)?;
+    let mut rows = Vec::new();
+    for (line_no, line) in BufReader::new(file).lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        rows.push(serde_json::from_str(&line).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("labeled line {}: {e}", line_no + 1),
+            )
+        })?);
+    }
+    Ok(rows)
+}
+
 pub fn write_observations(path: &Path, rows: &[PriceObservation]) -> io::Result<()> {
     let mut file = File::create(path)?;
     for row in rows {
@@ -409,6 +427,279 @@ pub fn write_observations(path: &Path, rows: &[PriceObservation]) -> io::Result<
         file.write_all(b"\n")?;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DatasetInventory {
+    pub total_feature_records: usize,
+    pub unique_launch_accounts: usize,
+    pub records_by_protocol: BTreeMap<String, usize>,
+    pub complete_windows: usize,
+    pub partial_windows: usize,
+    pub scanner_quality_flag_counts: BTreeMap<String, usize>,
+    pub records_with_usable_mints: usize,
+    pub records_ready_for_labeling: usize,
+    pub labeled: usize,
+    pub partially_labeled: usize,
+    pub unlabeled: usize,
+}
+
+pub fn inventory(features: &[Value], labels: Option<&[LabeledLaunch]>) -> DatasetInventory {
+    let mut result = DatasetInventory {
+        total_feature_records: features.len(),
+        ..Default::default()
+    };
+    let mut accounts = BTreeMap::new();
+    for row in features {
+        let account = row["launch_account"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        accounts.insert(account, true);
+        *result
+            .records_by_protocol
+            .entry(row["protocol"].as_str().unwrap_or("unknown").to_owned())
+            .or_default() += 1;
+        if row["complete_window"].as_bool() == Some(true) {
+            result.complete_windows += 1;
+        } else {
+            result.partial_windows += 1;
+        }
+        for flag in [
+            "scanner_drop_observed",
+            "stale_event_observed",
+            "rpc_rate_limited",
+            "approximate_trader_identity",
+            "partial_protocol_coverage",
+        ] {
+            if row["quality_flags"][flag].as_bool() == Some(true) {
+                *result
+                    .scanner_quality_flag_counts
+                    .entry(flag.to_owned())
+                    .or_default() += 1;
+            }
+        }
+        let mints = row["base_mint"]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .is_some()
+            && row["quote_mint"]
+                .as_str()
+                .filter(|v| !v.is_empty())
+                .is_some();
+        if mints {
+            result.records_with_usable_mints += 1;
+        }
+        if mints && quality_decision(row) == QualityDecision::Accept {
+            result.records_ready_for_labeling += 1;
+        }
+    }
+    result.unique_launch_accounts = accounts.len();
+    if let Some(labels) = labels {
+        for row in labels {
+            match row.outcome.label_status.as_str() {
+                "complete" => result.labeled += 1,
+                "partial" => result.partially_labeled += 1,
+                _ => result.unlabeled += 1,
+            }
+        }
+    }
+    result
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StrategyResult {
+    pub signals: usize,
+    pub wins: usize,
+    pub win_rate: Option<f64>,
+    pub average_return: Option<f64>,
+    pub median_return: Option<f64>,
+    pub expectancy: Option<f64>,
+    pub max_drawdown: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BacktestReport {
+    pub methodology_version: String,
+    pub dataset_size: usize,
+    pub labeled_samples: usize,
+    pub usable_samples: usize,
+    pub rejected_quality_samples: usize,
+    pub complete_samples: usize,
+    pub partial_samples: usize,
+    pub unlabeled_samples: usize,
+    pub chronological_train_samples: usize,
+    pub chronological_holdout_samples: usize,
+    pub score_bucket_counts: BTreeMap<String, usize>,
+    pub return_5m_by_score_bucket: BTreeMap<String, MetricSummary>,
+    pub correlations_return_5m: BTreeMap<String, Option<f64>>,
+    pub strategies: BTreeMap<String, StrategyResult>,
+    pub fee_per_side: f64,
+    pub slippage_per_side: f64,
+    pub warnings: Vec<String>,
+}
+
+pub fn net_return(gross: f64, fee: f64, slippage: f64) -> f64 {
+    (1.0 + gross) * (1.0 - fee - slippage).powi(2) - 1.0
+}
+
+fn strategy_result(
+    rows: &[&LabeledLaunch],
+    predicate: impl Fn(&LabeledLaunch) -> bool,
+    fee: f64,
+    slip: f64,
+) -> StrategyResult {
+    let mut returns: Vec<f64> = rows
+        .iter()
+        .filter(|r| predicate(r))
+        .filter_map(|r| r.outcome.return_5m)
+        .map(|r| net_return(r, fee, slip))
+        .collect();
+    let summary = metrics(&mut returns);
+    StrategyResult {
+        signals: summary.signals,
+        wins: summary.wins,
+        win_rate: (summary.signals > 0).then_some(summary.wins as f64 / summary.signals as f64),
+        average_return: summary.average_return,
+        median_return: summary.median_return,
+        expectancy: summary.expectancy,
+        max_drawdown: summary.max_drawdown,
+    }
+}
+
+pub fn backtest(rows: &[LabeledLaunch], fee: f64, slippage: f64) -> BacktestReport {
+    let labeled: Vec<_> = rows.iter().filter(|r| r.outcome.label_available).collect();
+    let usable: Vec<_> = labeled
+        .iter()
+        .filter(|r| quality_decision(&r.features) == QualityDecision::Accept)
+        .copied()
+        .collect();
+    let mut buckets = BTreeMap::new();
+    let mut grouped: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for row in &usable {
+        let key = bucket(row.momentum_score).to_owned();
+        *buckets.entry(key.clone()).or_default() += 1;
+        if let Some(r) = row.outcome.return_5m {
+            grouped
+                .entry(key)
+                .or_default()
+                .push(net_return(r, fee, slippage));
+        }
+    }
+    let mut bucket_metrics = BTreeMap::new();
+    for (key, mut values) in grouped {
+        bucket_metrics.insert(key, metrics(&mut values));
+    }
+    let mut warnings = Vec::new();
+    if usable.len() < 30 {
+        warnings.push("fewer than 30 usable samples: exploratory only".into());
+    } else if usable.len() < 100 {
+        warnings.push("30-100 usable samples: still weak evidence".into());
+    } else {
+        warnings.push("100+ samples: preliminary evaluation, not proof".into());
+    }
+    let split = if usable.len() >= 30 {
+        usable.len() * 70 / 100
+    } else {
+        usable.len()
+    };
+    let evaluation = &usable[split..];
+    if usable.len() < 30 {
+        warnings.push(
+            "chronological train/test holdout skipped because sample size is insufficient".into(),
+        );
+    }
+    let mut correlations = BTreeMap::new();
+    let mut scores = Vec::new();
+    let mut outcomes = Vec::new();
+    for row in &usable {
+        if let Some(outcome) = row.outcome.return_5m {
+            scores.push(row.momentum_score);
+            outcomes.push(outcome);
+        }
+    }
+    correlations.insert("momentum_score".into(), correlation(&scores, &outcomes));
+    for (name, values) in [
+        (
+            "swap_rate",
+            usable
+                .iter()
+                .filter_map(|r| r.features["swap_rates_10_30_60s"][2].as_f64())
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "tx_rate",
+            usable
+                .iter()
+                .filter_map(|r| r.features["transaction_rates_10_30_60s"][2].as_f64())
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "acceleration",
+            usable
+                .iter()
+                .filter_map(|r| r.features["transaction_acceleration_10_30_60s"][2].as_f64())
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "unique_payers",
+            usable
+                .iter()
+                .filter_map(|r| r.features["approximate_unique_fee_payers_10_30_60s"][2].as_f64())
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        correlations.insert(name.into(), correlation(&values, &outcomes));
+    }
+    let mut strategies = BTreeMap::new();
+    for (name, threshold) in [
+        ("momentum_ge_40", 40.0),
+        ("momentum_ge_60", 60.0),
+        ("momentum_ge_80", 80.0),
+    ] {
+        strategies.insert(
+            name.into(),
+            strategy_result(evaluation, |r| r.momentum_score >= threshold, fee, slippage),
+        );
+    }
+    strategies.insert(
+        "momentum_ge_40_payers_ge_3".into(),
+        strategy_result(
+            evaluation,
+            |r| strategy_b(&r.features, 40.0, 3),
+            fee,
+            slippage,
+        ),
+    );
+    strategies.insert(
+        "positive_acceleration_clean".into(),
+        strategy_result(evaluation, |r| strategy_c(&r.features, 0.0), fee, slippage),
+    );
+    BacktestReport {
+        methodology_version: "p3-exploratory-v1".into(),
+        dataset_size: rows.len(),
+        labeled_samples: labeled.len(),
+        usable_samples: usable.len(),
+        rejected_quality_samples: labeled.len() - usable.len(),
+        complete_samples: usable
+            .iter()
+            .filter(|r| r.outcome.label_status == "complete")
+            .count(),
+        partial_samples: usable
+            .iter()
+            .filter(|r| r.outcome.label_status == "partial")
+            .count(),
+        unlabeled_samples: rows.len() - labeled.len(),
+        chronological_train_samples: split,
+        chronological_holdout_samples: usable.len() - split,
+        score_bucket_counts: buckets,
+        return_5m_by_score_bucket: bucket_metrics,
+        correlations_return_5m: correlations,
+        strategies,
+        fee_per_side: fee,
+        slippage_per_side: slippage,
+        warnings,
+    }
 }
 
 pub fn score_report(rows: &[LabeledLaunch]) -> String {
@@ -562,5 +853,27 @@ mod tests {
         assert_eq!(m.signals, 3);
         assert_eq!(m.wins, 2);
         assert_eq!(metrics(&mut []).signals, 0);
+    }
+    #[test]
+    fn inventory_and_cost_adjustment_are_stable() {
+        let mut first = feature();
+        first["complete_window"] = true.into();
+        let mut duplicate = feature();
+        duplicate["complete_window"] = false.into();
+        let rows = vec![first, duplicate];
+        let report = inventory(&rows, None);
+        assert_eq!(report.total_feature_records, 2);
+        assert_eq!(report.unique_launch_accounts, 1);
+        assert_eq!(report.complete_windows, 1);
+        assert!((net_return(0.0, 0.01, 0.01) + 0.0396).abs() < 1e-12);
+    }
+    #[test]
+    fn backtest_report_serializes_and_warns_on_small_sample() {
+        let row = make_labeled(feature(), &[]);
+        let report = backtest(&[row], 0.0, 0.0);
+        assert_eq!(report.usable_samples, 0);
+        assert_eq!(report.chronological_holdout_samples, 0);
+        assert!(report.warnings.iter().any(|w| w.contains("exploratory")));
+        serde_json::to_string(&report).unwrap();
     }
 }
