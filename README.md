@@ -361,3 +361,61 @@ not present in the verified instruction account order; the scanner does not
 infer them from arbitrary transaction accounts. V14 still observes confirmed
 notifications without historical backfill, fork reconciliation, or unlimited
 reordering, and V13 freshness limits can discard delayed work.
+
+## Phase 2 — Historical Research (P1)
+
+The `research` crate is an offline companion to ingestion. It reads
+`features_v15.jsonl` and optionally joins a CSV of timestamped prices to create
+`research/data/labeled_launches.jsonl`. The live scanner intentionally omits
+price, so P1 never invents an outcome: a launch without sufficient future price
+observations remains unlabeled and is reported in coverage counts.
+
+The supported price input is deliberately explicit:
+
+```text
+launch_account,timestamp_unix,price_quote_per_base,source
+POOL...,1700000000,0.00000123,onchain_reserves_or_verified_export
+```
+
+The preferred source is an on-chain derived reserve or swap observation for the
+same pool and quote mint, exported by a separate verifier. Solana's official
+[`getTransaction` RPC](https://solana.com/docs/rpc/http/gettransaction) provides
+confirmed transaction metadata and block time; Raydium's official
+[SDK/API](https://github.com/raydium-io/raydium-sdk-V2) documents pool and mint
+lookups. The research tool records the supplied `source` and does not call a
+provider or use credentials. External providers can be converted to this CSV
+through a separately audited adapter.
+
+Outcome definitions use the first price at or after creation as the baseline,
+then use the latest observation at or before each horizon. Returns are
+`price_horizon / baseline - 1`. Maximum return is the greatest pointwise return
+inside the window. Maximum drawdown is the lowest `return - running_peak` in the
+window. Horizons are 1m, 5m, 15m, and 1h; maximum return and drawdown are
+reported for 5m and 15m. This conservative timestamp alignment avoids using a
+price observed after a target horizon. Features are read as recorded and are
+never recomputed from future prices.
+
+Run the offline evaluator with no network access:
+
+```bash
+cargo run -p research -- --features ingestion/data/features_v15.jsonl
+cargo run -p research -- --features path/features_v15.jsonl --prices path/prices.csv --output research/data/labeled_launches.jsonl
+```
+
+The labeled schema contains protocol, launch account, mints, creation time, the
+original V15 feature object, momentum score, quality flags, outcome horizons,
+availability, and price-data source. The report gives total/usable/unlabeled
+coverage, quality rejections, score buckets (0–20, 20–40, 40–60, 60–80,
+80–100), gross win rate, mean/median return, drawdown, expectancy, and simple
+feature correlations when there are at least two usable observations. Strategy
+helpers are intentionally small and deterministic: score ≥40, score ≥40 with
+at least 3 approximate payers, and positive final-window acceleration with
+clean quality flags. No parameter sweep or random split is used; a future
+chronological train/test split should be added only after enough timestamped
+launches exist.
+
+Metrics are gross and unadjusted: fees, slippage, latency, and execution are not
+modeled. The current repository contains no labeled historical samples, so it
+cannot support a predictive or profitability conclusion. The largest remaining
+limitation is obtaining a sufficiently complete, independently verified,
+timestamp-aligned on-chain price history across all supported pool types.

@@ -1,0 +1,4 @@
+launch_account,timestamp_unix,price_quote_per_base,source
+POOLfixture11111111111111111111111111111111,1700000000,10.0,onchain_reserve_fixture
+POOLfixture11111111111111111111111111111111,1700000060,12.0,onchain_reserve_fixture
+POOLfixture11111111111111111111111111111111,1700000300,9.0,onchain_reserve_fixture

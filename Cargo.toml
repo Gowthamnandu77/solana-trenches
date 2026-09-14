@@ -1,6 +1,7 @@
 [workspace]
 default-members = ["ingestion"]
 members = [ "ingestion",
+    "research",
     "programs/*"
 ]
 resolver = "2"
