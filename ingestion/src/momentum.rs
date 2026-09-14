@@ -26,6 +26,7 @@ struct Pool {
     slot: u64,
     block_time: Option<i64>,
     detected_at: String,
+    detection_lag_ms: u64,
     start: f64,
     next: usize,
     buckets: [Counts; 3],
@@ -36,15 +37,30 @@ struct Pool {
 pub struct Tracker {
     pools: BTreeMap<String, Pool>,
     pub rejected_pools: u64,
+    completed_features: Vec<Value>,
 }
 impl Tracker {
-    pub fn register(
+    #[cfg(test)]
+    fn register(
         &mut self,
         info: NewPoolInfo,
         signature: &str,
         slot: u64,
         block_time: Option<i64>,
         detected_at: &str,
+        now: f64,
+    ) -> bool {
+        self.register_with_lag(info, signature, slot, block_time, detected_at, 0, now)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_with_lag(
+        &mut self,
+        info: NewPoolInfo,
+        signature: &str,
+        slot: u64,
+        block_time: Option<i64>,
+        detected_at: &str,
+        detection_lag_ms: u64,
         now: f64,
     ) -> bool {
         if self.pools.contains_key(&info.pool_state) {
@@ -62,6 +78,7 @@ impl Tracker {
                 slot,
                 block_time,
                 detected_at: detected_at.to_owned(),
+                detection_lag_ms,
                 start: now,
                 next: 0,
                 buckets: Default::default(),
@@ -134,6 +151,9 @@ impl Tracker {
             while pool.next < 3 && now - pool.start >= ENDS[pool.next] as f64 {
                 snapshots.push(pool.snapshot(pool.next, ENDS[pool.next] as f64, true));
                 pool.next += 1;
+                if pool.next == 3 {
+                    self.completed_features.push(pool.feature(true));
+                }
             }
         }
         self.pools.retain(|_, p| p.next < 3);
@@ -143,9 +163,13 @@ impl Tracker {
         let mut result = self.advance(now);
         for pool in self.pools.values() {
             result.push(pool.snapshot(pool.next, (now - pool.start).max(0.0), false));
+            self.completed_features.push(pool.feature(false));
         }
         self.pools.clear();
         result
+    }
+    pub fn take_features(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.completed_features)
     }
 }
 
@@ -179,7 +203,7 @@ impl Pool {
             previous.map(|p| (STARTS[i] as f64 + elapsed - (STARTS[p] + ENDS[p]) as f64) / 2.0);
         let payers: HashSet<_> = self.buckets[..=i].iter().flat_map(|c| &c.payers).collect();
         json!({
-            "schema_version": 14, "protocol": self.info.protocol, "launch_account": self.info.pool_state, "pool_state": self.info.pool_state,
+            "schema_version": 15, "protocol": self.info.protocol, "launch_account": self.info.pool_state, "pool_state": self.info.pool_state,
             "token_mint_0": self.info.token_mint_0, "token_mint_1": self.info.token_mint_1,
             "creation_signature": self.signature, "creation_slot": self.slot,
             "creation_timestamp": self.block_time, "detected_at": self.detected_at,
@@ -200,6 +224,73 @@ impl Pool {
             "cumulative_unique_traders": payers.len() as u64,
             "counts_capped": self.capped,
             "coverage": "best_effort_confirmed_no_backfill"
+        })
+    }
+
+    fn feature(&self, complete_window: bool) -> Value {
+        let durations = [10.0, 20.0, 30.0];
+        let tx: Vec<u64> = self.buckets.iter().map(|c| c.tx).collect();
+        let swaps: Vec<u64> = self.buckets.iter().map(|c| c.swaps).collect();
+        let rates = |values: &[u64]| -> Vec<f64> {
+            values
+                .iter()
+                .zip(durations)
+                .map(|(v, d)| *v as f64 / d)
+                .collect()
+        };
+        let tx_rates = rates(&tx);
+        let swap_rates = rates(&swaps);
+        let tx_acceleration = vec![
+            0.0,
+            (tx_rates[1] - tx_rates[0]) / 15.0,
+            (tx_rates[2] - tx_rates[1]) / 25.0,
+        ];
+        let swap_acceleration = vec![
+            0.0,
+            (swap_rates[1] - swap_rates[0]) / 15.0,
+            (swap_rates[2] - swap_rates[1]) / 25.0,
+        ];
+        let unique: Vec<u64> = (0..3)
+            .map(|i| {
+                self.buckets[..=i]
+                    .iter()
+                    .flat_map(|c| &c.payers)
+                    .collect::<HashSet<_>>()
+                    .len() as u64
+            })
+            .collect();
+        let activity = |f: fn(&Counts) -> u64| -> Vec<u64> { self.buckets.iter().map(f).collect() };
+        json!({
+            "schema_version": 15,
+            "protocol": self.info.protocol,
+            "launch_account": self.info.pool_state,
+            "base_mint": self.info.token_mint_0,
+            "quote_mint": self.info.token_mint_1,
+            "creation_signature": self.signature,
+            "slot": self.slot,
+            "block_time": self.block_time,
+            "local_detection_time": self.detected_at,
+            "detection_lag_ms": self.detection_lag_ms,
+            "tx_counts_10_30_60s": tx,
+            "swap_counts_10_30_60s": swaps,
+            "approximate_unique_fee_payers_10_30_60s": unique,
+            "transaction_rates_10_30_60s": tx_rates,
+            "swap_rates_10_30_60s": swap_rates,
+            "transaction_acceleration_10_30_60s": tx_acceleration,
+            "swap_acceleration_10_30_60s": swap_acceleration,
+            "protocol_activity_counts": {
+                "raydium_cpmm": activity(|c| c.cpmm),
+                "raydium_clmm": activity(|c| c.clmm),
+                "raydium_launchlab": activity(|c| c.launchlab)
+            },
+            "momentum_score": momentum_score(tx_rates[2], swap_rates[2], Some(swap_rates[2] - swap_rates[1])),
+            "complete_window": complete_window,
+            "scanner_drop_observed": false,
+            "stale_event_observed": false,
+            "rpc_rate_limited": false,
+            "approximate_trader_identity": true,
+            "partial_protocol_coverage": false,
+            "quality_flags": []
         })
     }
 }
@@ -399,5 +490,23 @@ mod tests {
         assert_eq!(momentum_score(0.0, 0.0, None), 0.0);
         assert_eq!(momentum_score(0.2, 0.3, Some(0.1)), 22.0);
         assert_eq!(momentum_score(10.0, 10.0, Some(2.0)), 100.0);
+    }
+
+    #[test]
+    fn completed_feature_contains_stable_windows_and_quality_fields() {
+        let mut t = Tracker::default();
+        assert!(register(&mut t, "feature", 0.0));
+        t.observe("swap-1", Some("payer"), &[record("feature", true)], 1.0);
+        let snapshots = t.advance(60.0);
+        assert_eq!(snapshots.len(), 3);
+        let features = t.take_features();
+        assert_eq!(features.len(), 1);
+        let feature = &features[0];
+        assert_eq!(feature["schema_version"], 15);
+        assert_eq!(feature["tx_counts_10_30_60s"].as_array().unwrap().len(), 3);
+        assert_eq!(feature["swap_counts_10_30_60s"][0], 1);
+        assert_eq!(feature["complete_window"], true);
+        assert_eq!(feature["approximate_trader_identity"], true);
+        serde_json::to_string(feature).unwrap();
     }
 }

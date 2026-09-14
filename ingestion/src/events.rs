@@ -70,7 +70,7 @@ impl LaunchEvent {
 
     pub fn to_value(&self, cluster: &str) -> Value {
         json!({
-            "schema_version": 14,
+            "schema_version": 15,
             "cluster": cluster,
             "protocol": self.protocol,
             "event_type": self.event_type,
@@ -133,7 +133,7 @@ mod tests {
             },
         );
         let value = event.to_value("mainnet");
-        assert_eq!(value["schema_version"], 14);
+        assert_eq!(value["schema_version"], 15);
         assert_eq!(value["event_type"], "launch_created");
         assert_eq!(value["launch_account"], "launch");
         assert_eq!(value["creator"], "creator");

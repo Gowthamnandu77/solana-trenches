@@ -1,6 +1,7 @@
 mod config;
 mod dedup;
 mod events;
+mod features;
 mod fetcher;
 mod freshness;
 mod listener;
@@ -32,14 +33,20 @@ type Error = Box<dyn std::error::Error>;
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let config = config::load_config()?;
-    println!("Solana Trenches — Multi-Protocol Solana Launch Tracker V14 (READ ONLY)");
-    println!("Cluster: {}", config.cluster);
+    println!("Solana Trenches — Solana Launch Intelligence Engine V15 (READ ONLY)");
+    println!(
+        "Cluster: {} | protocols: {}",
+        config.cluster,
+        enabled_protocols(&config)
+    );
     // Manifest-relative path is stable whether run from the workspace or ingestion.
     let mut files = Persistence::open(&Path::new(env!("CARGO_MANIFEST_DIR")).join("data")).await?;
     let metrics = Arc::new(Metrics::default());
     println!(
-        "Fetch concurrency={} request spacing={}ms",
-        config.max_fetch_concurrency, config.rpc_request_interval_ms
+        "Fetch concurrency={} request spacing={}ms stale fetch/momentum={}/{}ms verbose={} HTTP={} WS={}",
+        config.max_fetch_concurrency, config.rpc_request_interval_ms,
+        config.max_fetch_start_age_ms, config.max_momentum_event_age_ms, config.verbose,
+        redact_endpoint(&config.http_url), redact_endpoint(&config.ws_url)
     );
     let (sender, receiver) = mpsc::channel(config.input_queue_capacity);
     let (fetched_sender, mut fetched_receiver) = mpsc::channel(128);
@@ -88,12 +95,14 @@ async fn main() -> Result<(), Error> {
                     report_metrics(&mut files, &metrics, start.elapsed().as_secs_f64()).await?;
                 }
                 _ = timer.tick() => {
-                    snapshots(&mut files, tracker.advance(start.elapsed().as_secs_f64())).await?;
+                    snapshots(&mut files, tracker.advance(start.elapsed().as_secs_f64()), &metrics).await?;
+                    features(&mut files, tracker.take_features(), &config, &metrics).await?;
                 }
                 event = fetched_receiver.recv() => {
                     let Some(event) = event else { break; };
                     let now = start.elapsed().as_secs_f64();
-                    snapshots(&mut files, tracker.advance(now)).await?;
+                    snapshots(&mut files, tracker.advance(now), &metrics).await?;
+                    features(&mut files, tracker.take_features(), &config, &metrics).await?;
                     process(&config, event, &mut tracker, &mut files, now, &metrics).await?;
                 }
             }
@@ -104,25 +113,40 @@ async fn main() -> Result<(), Error> {
     // deliberately discarded; persisted JSON lines are never cancelled mid-write.
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
-    let final_snapshots =
-        snapshots(&mut files, tracker.shutdown(start.elapsed().as_secs_f64())).await;
+    let final_snapshots = snapshots(
+        &mut files,
+        tracker.shutdown(start.elapsed().as_secs_f64()),
+        &metrics,
+    )
+    .await;
+    let final_features = features(&mut files, tracker.take_features(), &config, &metrics).await;
     let final_metrics = report_metrics(&mut files, &metrics, start.elapsed().as_secs_f64()).await;
     let flushed = files.flush().await;
     println!(
-        "Stopped; dropped_logs={} reconnects={} fetch_failures={} rejected_pools={}",
+        "Stopped; runtime={:.1}s notifications={} drops={} duplicates={} stale={} fetches={} retries={} rate_limits={} failures={} decoded={} launches={} snapshots={} queue_peak={} lag={}",
+        start.elapsed().as_secs_f64(),
+        metrics.notifications_received.load(Ordering::Relaxed),
         listener::DROPPED_LOGS.load(Ordering::Relaxed),
-        listener::RECONNECTS.load(Ordering::Relaxed),
-        fetcher::FETCH_FAILURES.load(Ordering::Relaxed),
-        tracker.rejected_pools
+        metrics.duplicates.load(Ordering::Relaxed), metrics.stale_before_momentum.load(Ordering::Relaxed),
+        metrics.attempts.load(Ordering::Relaxed), metrics.retries.load(Ordering::Relaxed),
+        metrics.rate_limits.load(Ordering::Relaxed), metrics.failures.load(Ordering::Relaxed),
+        metrics.decoded.load(Ordering::Relaxed), metrics.launches_detected.load(Ordering::Relaxed),
+        metrics.snapshots_emitted.load(Ordering::Relaxed), metrics.queue_high_water.load(Ordering::Relaxed),
+        metrics.processing_lag.snapshot()
     );
     result?;
     final_snapshots?;
+    final_features?;
     final_metrics?;
     flushed?;
     Ok(())
 }
 
-async fn snapshots(files: &mut Persistence, values: Vec<Value>) -> Result<(), Error> {
+async fn snapshots(
+    files: &mut Persistence,
+    values: Vec<Value>,
+    metrics: &Metrics,
+) -> Result<(), Error> {
     for mut value in values {
         value["timestamp"] = json!(Utc::now().to_rfc3339());
         value["scanner_dropped_logs_total"] = json!(listener::DROPPED_LOGS.load(Ordering::Relaxed));
@@ -130,6 +154,7 @@ async fn snapshots(files: &mut Persistence, values: Vec<Value>) -> Result<(), Er
         value["scanner_fetch_failures_total"] =
             json!(fetcher::FETCH_FAILURES.load(Ordering::Relaxed));
         files.write(Stream::Momentum, &value).await?;
+        metrics.snapshots_emitted.fetch_add(1, Ordering::Relaxed);
     }
     Ok(())
 }
@@ -200,7 +225,7 @@ async fn process(
     let timestamp = Utc::now().to_rfc3339();
     for record in records.iter().filter(|r| !r.known) {
         files.write(Stream::Unknown, &json!({
-            "schema_version": 14, "timestamp": timestamp, "cluster": config.cluster,
+            "schema_version": 15, "timestamp": timestamp, "cluster": config.cluster,
             "slot": fetched.slot, "signature": log.signature, "source": log.source,
             "protocol": record.protocol, "name": record.name, "discriminator": record.discriminator,
             "source_invoked": source_invoked
@@ -232,18 +257,20 @@ async fn process(
             .write(Stream::Events, &event.to_value(&config.cluster))
             .await?;
     }
+    let pool_count = pools.len() as u64;
     for pool in pools {
         let registered = !stale
-            && tracker.register(
+            && tracker.register_with_lag(
                 pool.clone(),
                 &log.signature,
                 fetched.slot,
                 fetched.block_time,
                 &timestamp,
+                local_age_ms,
                 observed_now,
             );
         files.write(Stream::Pools, &json!({
-            "schema_version": 14, "detected_at": timestamp, "cluster": config.cluster,
+            "schema_version": 15, "detected_at": timestamp, "cluster": config.cluster,
             "block_time": fetched.block_time, "slot": fetched.slot, "signature": log.signature,
             "protocol": pool.protocol, "instruction": pool.instruction, "pool_state": pool.pool_state,
             "token_mint_0": pool.token_mint_0, "token_mint_1": pool.token_mint_1,
@@ -255,6 +282,9 @@ async fn process(
             pool.protocol, pool.pool_state
         );
     }
+    metrics
+        .launches_detected
+        .fetch_add(pool_count, Ordering::Relaxed);
     let momentum_start = Instant::now();
     if !stale {
         tracker.observe(&log.signature, payer.as_deref(), &records, observed_now);
@@ -262,13 +292,55 @@ async fn process(
     metrics
         .momentum_latency
         .observe(momentum_start.elapsed().as_millis() as u64);
-    println!(
-        "[{}] status={status} instructions={names:?} multi_route={}",
-        log.source,
-        records.iter().any(|r| r.protocol == "raydium_cpmm")
-            && records.iter().any(|r| r.protocol == "raydium_clmm")
-    );
+    if config.verbose {
+        println!(
+            "[{}] status={status} instructions={names:?} multi_route={}",
+            log.source,
+            records.iter().any(|r| r.protocol == "raydium_cpmm")
+                && records.iter().any(|r| r.protocol == "raydium_clmm")
+        );
+    }
     Ok(())
+}
+
+async fn features(
+    files: &mut Persistence,
+    values: Vec<Value>,
+    config: &Config,
+    metrics: &Metrics,
+) -> Result<(), Error> {
+    for mut value in values {
+        features::apply_quality_flags(&mut value, config.launchlab_program.is_none(), metrics);
+        files.write(Stream::Features, &value).await?;
+    }
+    Ok(())
+}
+
+fn enabled_protocols(config: &Config) -> String {
+    let mut protocols = vec!["raydium_cpmm", "raydium_clmm"];
+    if config.launchlab_program.is_some() {
+        protocols.push("raydium_launchlab");
+    }
+    protocols.join(",")
+}
+
+fn redact_endpoint(raw: &str) -> String {
+    let (scheme, rest) = raw.split_once("://").unwrap_or(("", raw));
+    let host = rest
+        .split('/')
+        .next()
+        .unwrap_or(rest)
+        .split('?')
+        .next()
+        .unwrap_or(rest)
+        .split('@')
+        .next_back()
+        .unwrap_or(rest);
+    if scheme.is_empty() {
+        host.to_owned()
+    } else {
+        format!("{scheme}://{host}")
+    }
 }
 
 #[cfg(test)]
@@ -290,6 +362,7 @@ mod tests {
             cpmm_program: "cp",
             clmm_program: "cl",
             launchlab_program: None,
+            verbose: false,
         };
         let transaction = json!({"transaction":{"message":{"instructions":[{
             "programId":"cl", "data":bs58::encode([233,146,209,142,207,104,64,188]).into_string(),
@@ -344,6 +417,7 @@ mod tests {
             cpmm_program: "cp",
             clmm_program: "cl",
             launchlab_program: None,
+            verbose: false,
         };
         let ix = |program: &str, disc: [u8; 8], accounts: Vec<&str>| {
             json!({
@@ -391,7 +465,9 @@ mod tests {
         )
         .await
         .unwrap();
-        snapshots(&mut files, tracker.advance(60.0)).await.unwrap();
+        snapshots(&mut files, tracker.advance(60.0), &Metrics::default())
+            .await
+            .unwrap();
         files.flush().await.unwrap();
         drop(files);
         for (name, expected) in [
@@ -400,7 +476,7 @@ mod tests {
             ("unknown_instructions", 1),
             ("momentum_snapshots", 3),
         ] {
-            let data = tokio::fs::read_to_string(dir.join(format!("{name}_v14.jsonl")))
+            let data = tokio::fs::read_to_string(dir.join(format!("{name}_v15.jsonl")))
                 .await
                 .unwrap();
             assert!(data.ends_with('\n'));
@@ -432,7 +508,7 @@ async fn report_metrics(
     let mut value = metrics.snapshot();
     value["timestamp"] = json!(Utc::now().to_rfc3339());
     value["elapsed_seconds"] = json!(seconds);
-    value["schema_version"] = json!(14);
+    value["schema_version"] = json!(15);
     println!("METRICS {value}");
     files.write(Stream::Metrics, &value).await?;
     Ok(())

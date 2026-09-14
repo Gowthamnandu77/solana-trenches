@@ -40,6 +40,8 @@ pub struct Metrics {
     pub peak: AtomicU64,
     pub jobs: AtomicU64,
     pub cancelled: AtomicU64,
+    pub launches_detected: AtomicU64,
+    pub snapshots_emitted: AtomicU64,
 }
 impl Metrics {
     pub fn snapshot(&self) -> Value {
@@ -74,6 +76,8 @@ impl Metrics {
             "rpc_attempts":get(&self.attempts), "current_fetch_concurrency":get(&self.current),
             "peak_fetch_concurrency":get(&self.peak), "active_jobs":get(&self.jobs),
             "cancelled_jobs":get(&self.cancelled),
+            "launches_detected": get(&self.launches_detected),
+            "snapshots_emitted": get(&self.snapshots_emitted),
             "mean_fetch_attempt_ms": if n == 0 { 0.0 } else { get(&self.attempt_micros) as f64 / n as f64 / 1000.0 }
         })
     }

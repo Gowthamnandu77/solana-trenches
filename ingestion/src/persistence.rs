@@ -6,7 +6,7 @@ use tokio::{
 };
 
 pub struct Persistence {
-    files: [BufWriter<File>; 5],
+    files: [BufWriter<File>; 6],
 }
 #[derive(Clone, Copy)]
 pub enum Stream {
@@ -15,6 +15,7 @@ pub enum Stream {
     Unknown = 2,
     Momentum = 3,
     Metrics = 4,
+    Features = 5,
 }
 impl Persistence {
     pub async fn open(directory: &Path) -> io::Result<Self> {
@@ -30,11 +31,12 @@ impl Persistence {
         }
         Ok(Self {
             files: [
-                file(directory, "launch_events_v14.jsonl").await?,
-                file(directory, "new_launches_v14.jsonl").await?,
-                file(directory, "unknown_instructions_v14.jsonl").await?,
-                file(directory, "momentum_snapshots_v14.jsonl").await?,
-                file(directory, "runtime_metrics_v14.jsonl").await?,
+                file(directory, "launch_events_v15.jsonl").await?,
+                file(directory, "new_launches_v15.jsonl").await?,
+                file(directory, "unknown_instructions_v15.jsonl").await?,
+                file(directory, "momentum_snapshots_v15.jsonl").await?,
+                file(directory, "runtime_metrics_v15.jsonl").await?,
+                file(directory, "features_v15.jsonl").await?,
             ],
         })
     }

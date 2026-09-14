@@ -22,6 +22,7 @@ pub struct Config {
     pub cpmm_program: &'static str,
     pub clmm_program: &'static str,
     pub launchlab_program: Option<&'static str>,
+    pub verbose: bool,
 }
 
 pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
@@ -81,6 +82,9 @@ pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
         cpmm_program,
         clmm_program,
         launchlab_program: mainnet.then_some(MAINNET_LAUNCHLAB),
+        verbose: env::var("VERBOSE")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false),
     })
 }
 

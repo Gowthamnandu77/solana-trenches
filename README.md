@@ -2,20 +2,21 @@
 
 A Rust/Solana engineering and market-intelligence project. The repository contains an Anchor program under `programs/` and a separate read-only ingestion application under `ingestion/`.
 
-## Multi-Protocol Solana Launch Tracker — V14
+## Solana Launch Intelligence Engine — V15
 
-Targeted Solana WebSocket subscriptions watch Raydium CPMM and CLMM program mentions. An async Rust pipeline fetches successful confirmed transactions, decodes outer and inner Raydium instructions, detects pool creation, and tracks newly observed pools concurrently. V10 program IDs, discriminator mappings, protocol classifications, unknown-instruction discovery, and route detection are retained.
+Targeted Solana WebSocket subscriptions feed verified Raydium decoders and a normalized launch event model. The read-only Rust pipeline applies freshness rules, tracks each launch or pool through 10/30/60-second windows, emits explainable activity features, and preserves quality flags for later research. It is an engineering and data-product project, not a trading system.
 
 ```text
-CPMM logs subscription ─┐
-                       ├─ bounded MPSC (2,000) ─ dedup + bounded concurrent fetch jobs
-CLMM logs subscription ─┘                              │
-                                             bounded MPSC (128)
-                                                      │
-                                  decoder + pool tracker + 100ms timer
-                                                      │
-                                 events / new pairs / unknowns / snapshots
-                                               append-only JSONL
+CPMM / CLMM / LaunchLab logs
+              │ bounded intake queue + signature deduplication
+              ▼
+      bounded fetch jobs ─ shared request pacing ─ retry/cooldown
+              │
+              ▼
+ verified outer/inner decoding ─ freshness filter ─ normalized LaunchEvent
+              │                                      │
+              ▼                                      ▼
+     per-launch windows ──────────────── append-only V15 JSONL dataset
 ```
 
 This is a learning and portfolio project, not a production-ready indexer or a profitability claim. It never loads wallets, signs or sends transactions, or trades tokens.
@@ -70,11 +71,12 @@ JSONL files grow on disk and need external retention/rotation for longer runs. M
 
 Paths are anchored to `ingestion/data/` regardless of the launch directory:
 
-- `raydium_events_v12.jsonl`
-- `new_pairs_v12.jsonl`
-- `unknown_instructions_v12.jsonl`
-- `momentum_snapshots_v12.jsonl`
-- `runtime_metrics_v12.jsonl` (every 10 seconds and at shutdown)
+- `launch_events_v15.jsonl`
+- `new_launches_v15.jsonl`
+- `unknown_instructions_v15.jsonl`
+- `momentum_snapshots_v15.jsonl`
+- `features_v15.jsonl`
+- `runtime_metrics_v15.jsonl` (every 10 seconds and at shutdown)
 
 All are append-only, versioned structured JSONL and ignored by Git. Empty pool/snapshot files during a short run are expected if no new pool is observed. Generated trading data, `.env`, wallet/key files, build artifacts, and dependencies should remain local.
 
@@ -196,6 +198,99 @@ Root Cargo commands default to the `ingestion` package. The preserved Anchor cou
 example remains a separate workspace member; its LiteSVM integration test requires
 `target/deploy/solana_trenches.so` from an SBF build and is not part of scanner tests.
 Workspace formatting also normalized three existing counter-example files.
+
+## V15 feature dataset
+
+V15 keeps the verified Raydium CPMM, CLMM, and Mainnet LaunchLab coverage from
+V14. It emits one `features_v15.jsonl` record per launch or pool when its
+60-second lifecycle completes, or a partial record during graceful shutdown.
+The record contains protocol, launch account, mints, creation metadata,
+10/30/60-second transaction and swap counts, cumulative approximate fee-payer
+sets, rates, acceleration, protocol activity counts, the deterministic score,
+and scanner quality indicators. Missing or uncertain values are retained as
+null or explicitly flagged; the scanner does not infer price, liquidity, USD
+value, PnL, buy pressure, bot identity, or profitability.
+
+The score is an activity index:
+
+```text
+score = clamp(20 * tx_rate + 50 * swap_rate
+              + 30 * max(swap_rate - previous_swap_rate, 0), 0, 100)
+```
+
+Rates are per second for the relevant window and are normalized against one
+transaction/second and one swap/second. Acceleration is the rate change divided
+by the midpoint distance between adjacent windows (15 seconds, then 25
+seconds). The score is deterministic, bounded, and explainable. It measures
+observed local activity; it is not a price, liquidity, trading, or return
+prediction.
+
+Every feature includes `quality_flags`: `complete_window`,
+`scanner_drop_observed`, `stale_event_observed`, `rpc_rate_limited`,
+`approximate_trader_identity`, and `partial_protocol_coverage`. A complete
+window means the local monotonic timer reached 60 seconds. Fee-payer counts are
+an approximate signer proxy and are marked accordingly. A research consumer
+should filter these flags before treating records as comparable samples.
+
+Example sanitized record:
+
+```json
+{"schema_version":15,"protocol":"raydium_launchlab","launch_account":"Launch...","base_mint":"Base...","quote_mint":"So111...","tx_counts_10_30_60s":[4,11,19],"swap_counts_10_30_60s":[2,8,14],"momentum_score":31.2,"complete_window":true,"quality_flags":{"scanner_drop_observed":false,"stale_event_observed":false,"rpc_rate_limited":false,"approximate_trader_identity":true,"partial_protocol_coverage":false}}
+```
+
+### V15 runtime UX and configuration
+
+Startup reports version, cluster, enabled protocols, redacted endpoint hosts,
+fetch concurrency, request spacing, stale thresholds, and verbose mode. Set
+`VERBOSE=true` for per-transaction decoder lines; normal mode prints important
+launches, periodic metrics, and a shutdown summary. Shutdown reports runtime,
+notifications, drops, duplicates, stale events, fetch attempts, retries, rate
+limits, failures, decoded transactions, launches, snapshots, queue peak, and
+lag histogram p50/p95/max. Endpoints are reduced to scheme and host before
+printing. `VERBOSE` is the only V15 display setting; existing environment
+variables control cluster, endpoints, queue, concurrency, pacing, and freshness.
+
+The backpressure model remains bounded: two listeners share a 2,000-entry input
+queue, the fetcher has at most the configured number of jobs, and its output
+queue holds 128 fetched transactions. A shared request gate and cooldown keep
+retries within the provider's allowance. Stale work is discarded before fetch
+or before momentum according to the V13 thresholds. JSONL is append-only and
+ignored by Git; rotate it outside the application for long runs.
+
+### V15 validation and benchmark
+
+From the repository root:
+
+```bash
+cargo fmt --check
+cargo clippy -- -D warnings
+cargo test
+cargo build
+git diff --check
+```
+
+The final benchmark command is read-only and uses the public Mainnet RPC with a
+bounded 65-second runtime:
+
+```bash
+SOLANA_CLUSTER=mainnet SOLANA_HTTP_URL=https://api.mainnet-beta.solana.com SOLANA_WS_URL=wss://api.mainnet-beta.solana.com/ NO_DNA=1 timeout --preserve-status --signal=INT --kill-after=10s 65s cargo run --quiet
+```
+
+The benchmark result and exact counters are recorded in the V15 delivery
+report. No new launch is required for a successful run: deterministic fixtures
+cover decoder and feature behavior, while live verification confirms listener,
+RPC, persistence, and shutdown behavior. Public RPC limits, notification
+backlog, no historical backfill, confirmed-fork changes, and incomplete
+protocol coverage remain limitations. LaunchLab devnet is disabled because its
+program identity was not independently verified from an official Raydium
+source. The project does not claim full Solana coverage, production readiness,
+or profitability.
+
+### Roadmap
+
+Future work may add separately verified protocols, durable replay/fork handling,
+provider-aware ingestion policies, dataset validation tooling, and historical
+backfills. Paper trading, backtesting, and financial claims are outside V15.
 
 ### V13 Mainnet benchmark (2026-09-14)
 
