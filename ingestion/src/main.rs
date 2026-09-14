@@ -2,17 +2,23 @@ mod config;
 mod dedup;
 mod fetcher;
 mod listener;
+mod metrics;
 mod momentum;
 mod persistence;
 mod raydium;
+mod rpc;
 
 use chrono::Utc;
 use config::Config;
 use fetcher::FetchedEvent;
+use metrics::Metrics;
 use momentum::Tracker;
 use persistence::{Persistence, Stream};
 use serde_json::{json, Value};
-use std::{path::Path, sync::atomic::Ordering};
+use std::{
+    path::Path,
+    sync::{atomic::Ordering, Arc},
+};
 use tokio::{
     sync::mpsc,
     task::JoinSet,
@@ -24,10 +30,15 @@ type Error = Box<dyn std::error::Error>;
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let config = config::load_config()?;
-    println!("Solana Trenches — Raydium New Pool Momentum Tracker V11 (READ ONLY)");
+    println!("Solana Trenches — Raydium New Pool Momentum Tracker V12 (READ ONLY)");
     println!("Cluster: {}", config.cluster);
     // Manifest-relative path is stable whether run from the workspace or ingestion.
     let mut files = Persistence::open(&Path::new(env!("CARGO_MANIFEST_DIR")).join("data")).await?;
+    let metrics = Arc::new(Metrics::default());
+    println!(
+        "Fetch concurrency={} request spacing={}ms",
+        config.max_fetch_concurrency, config.rpc_request_interval_ms
+    );
     let (sender, receiver) = mpsc::channel(2000);
     let (fetched_sender, mut fetched_receiver) = mpsc::channel(128);
     let mut tasks = JoinSet::new();
@@ -40,20 +51,31 @@ async fn main() -> Result<(), Error> {
             program,
             label,
             sender.clone(),
+            metrics.clone(),
         ));
     }
     drop(sender);
-    tasks.spawn(fetcher::run(config.clone(), receiver, fetched_sender));
+    tasks.spawn(fetcher::run(
+        config.clone(),
+        receiver,
+        fetched_sender,
+        metrics.clone(),
+    ));
     let start = Instant::now();
     let mut tracker = Tracker::default();
     let mut timer = interval(Duration::from_millis(100));
     timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut report = interval(Duration::from_secs(10));
+    report.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let result: Result<(), Error> = async {
         loop {
             tokio::select! {
                 biased;
                 signal = tokio::signal::ctrl_c() => { signal?; println!("Ctrl+C: stopping intake and fetches"); break; }
                 exited = tasks.join_next() => { return Err(format!("ingestion task stopped unexpectedly: {}", exited.is_some()).into()); }
+                _ = report.tick() => {
+                    report_metrics(&mut files, &metrics, start.elapsed().as_secs_f64()).await?;
+                }
                 _ = timer.tick() => {
                     snapshots(&mut files, tracker.advance(start.elapsed().as_secs_f64())).await?;
                 }
@@ -61,7 +83,7 @@ async fn main() -> Result<(), Error> {
                     let Some(event) = event else { break; };
                     let now = start.elapsed().as_secs_f64();
                     snapshots(&mut files, tracker.advance(now)).await?;
-                    process(&config, event, &mut tracker, &mut files, now).await?;
+                    process(&config, event, &mut tracker, &mut files, now, &metrics).await?;
                 }
             }
         }
@@ -73,6 +95,7 @@ async fn main() -> Result<(), Error> {
     while tasks.join_next().await.is_some() {}
     let final_snapshots =
         snapshots(&mut files, tracker.shutdown(start.elapsed().as_secs_f64())).await;
+    let final_metrics = report_metrics(&mut files, &metrics, start.elapsed().as_secs_f64()).await;
     let flushed = files.flush().await;
     println!(
         "Stopped; dropped_logs={} reconnects={} fetch_failures={} rejected_pools={}",
@@ -83,6 +106,7 @@ async fn main() -> Result<(), Error> {
     );
     result?;
     final_snapshots?;
+    final_metrics?;
     flushed?;
     Ok(())
 }
@@ -105,6 +129,7 @@ async fn process(
     tracker: &mut Tracker,
     files: &mut Persistence,
     now: f64,
+    metrics: &Metrics,
 ) -> Result<(), Error> {
     let log = &fetched.log;
     let records = raydium::collect_instruction_records(
@@ -128,18 +153,29 @@ async fn process(
     } else {
         "mentioned_only"
     };
+    metrics.processed.fetch_add(1, Ordering::Relaxed);
+    if status == "decoded" {
+        metrics.decoded.fetch_add(1, Ordering::Relaxed);
+    }
+    if status == "mentioned_only" {
+        metrics.mentioned_only.fetch_add(1, Ordering::Relaxed);
+    }
+    metrics.unknown.fetch_add(
+        records.iter().filter(|r| !r.known).count() as u64,
+        Ordering::Relaxed,
+    );
     let names: Vec<_> = records.iter().map(|r| r.name.as_str()).collect();
     let timestamp = Utc::now().to_rfc3339();
     for record in records.iter().filter(|r| !r.known) {
         files.write(Stream::Unknown, &json!({
-            "schema_version": 11, "timestamp": timestamp, "cluster": config.cluster,
+            "schema_version": 12, "timestamp": timestamp, "cluster": config.cluster,
             "slot": fetched.slot, "signature": log.signature, "source": log.source,
             "protocol": record.protocol, "name": record.name, "discriminator": record.discriminator,
             "source_invoked": source_invoked
         })).await?;
     }
     files.write(Stream::Events, &json!({
-        "schema_version": 11, "timestamp": timestamp, "cluster": config.cluster,
+        "schema_version": 12, "timestamp": timestamp, "cluster": config.cluster,
         "block_time": fetched.block_time, "slot": fetched.slot, "notification_slot": log.slot,
         "signature": log.signature, "source": log.source, "source_invoked": source_invoked,
         "source_invoke_count": raydium::program_invoke_count(&log.logs, log.program_id),
@@ -160,7 +196,7 @@ async fn process(
             now,
         );
         files.write(Stream::Pools, &json!({
-            "schema_version": 11, "detected_at": timestamp, "cluster": config.cluster,
+            "schema_version": 12, "detected_at": timestamp, "cluster": config.cluster,
             "block_time": fetched.block_time, "slot": fetched.slot, "signature": log.signature,
             "protocol": pool.protocol, "instruction": pool.instruction, "pool_state": pool.pool_state,
             "token_mint_0": pool.token_mint_0, "token_mint_1": pool.token_mint_1,
@@ -185,9 +221,11 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn synthetic_creation_route_and_snapshots_persist_as_jsonl() {
-        let dir = std::env::temp_dir().join(format!("trenches-v11-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("trenches-v12-test-{}", std::process::id()));
         let mut files = Persistence::open(&dir).await.unwrap();
         let config = Config {
+            max_fetch_concurrency: 8,
+            rpc_request_interval_ms: 100,
             cluster: "synthetic".into(),
             http_url: String::new(),
             ws_url: String::new(),
@@ -233,6 +271,7 @@ mod tests {
             &mut tracker,
             &mut files,
             0.0,
+            &Metrics::default(),
         )
         .await
         .unwrap();
@@ -245,7 +284,7 @@ mod tests {
             ("unknown_instructions", 1),
             ("momentum_snapshots", 3),
         ] {
-            let data = tokio::fs::read_to_string(dir.join(format!("{name}_v11.jsonl")))
+            let data = tokio::fs::read_to_string(dir.join(format!("{name}_v12.jsonl")))
                 .await
                 .unwrap();
             assert!(data.ends_with('\n'));
@@ -266,4 +305,18 @@ mod tests {
         }
         tokio::fs::remove_dir_all(dir).await.unwrap();
     }
+}
+
+async fn report_metrics(
+    files: &mut Persistence,
+    metrics: &Metrics,
+    seconds: f64,
+) -> Result<(), Error> {
+    let mut value = metrics.snapshot();
+    value["timestamp"] = json!(Utc::now().to_rfc3339());
+    value["elapsed_seconds"] = json!(seconds);
+    value["schema_version"] = json!(12);
+    println!("METRICS {value}");
+    files.write(Stream::Metrics, &value).await?;
+    Ok(())
 }

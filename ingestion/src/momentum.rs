@@ -173,7 +173,7 @@ impl Pool {
             previous.map(|p| (STARTS[i] as f64 + elapsed - (STARTS[p] + ENDS[p]) as f64) / 2.0);
         let payers: HashSet<_> = self.buckets[..=i].iter().flat_map(|c| &c.payers).collect();
         json!({
-            "schema_version": 11, "protocol": self.info.protocol, "pool_state": self.info.pool_state,
+            "schema_version": 12, "protocol": self.info.protocol, "pool_state": self.info.pool_state,
             "token_mint_0": self.info.token_mint_0, "token_mint_1": self.info.token_mint_1,
             "creation_signature": self.signature, "creation_slot": self.slot,
             "creation_timestamp": self.block_time, "detected_at": self.detected_at,

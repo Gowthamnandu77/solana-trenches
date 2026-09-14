@@ -2572,6 +2572,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "futures-util",
+ "reqwest",
  "serde_json",
  "solana-client",
  "solana-rpc-client-api",

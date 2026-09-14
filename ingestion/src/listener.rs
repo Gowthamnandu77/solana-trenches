@@ -1,8 +1,10 @@
+use crate::metrics::Metrics;
 use futures_util::StreamExt;
 use solana_client::{
     nonblocking::pubsub_client::PubsubClient,
     rpc_config::{CommitmentConfig, RpcTransactionLogsConfig, RpcTransactionLogsFilter},
 };
+use std::sync::{atomic::Ordering::Relaxed, Arc};
 use tokio::{
     sync::mpsc,
     time::{sleep, timeout, Duration, Instant},
@@ -24,6 +26,7 @@ pub async fn run_listener(
     program_id: &'static str,
     label: &'static str,
     sender: mpsc::Sender<LogEvent>,
+    metrics: Arc<Metrics>,
 ) {
     let mut backoff = 3;
     loop {
@@ -43,8 +46,10 @@ pub async fn run_listener(
             if let Ok(Ok((mut stream, unsubscribe))) = subscription {
                 println!("[{label}] LISTENER ACTIVE");
                 while let Some(response) = stream.next().await {
+                    metrics.notifications_received.fetch_add(1, Relaxed);
                     let value = response.value;
                     if value.err.is_some() {
+                        metrics.notifications_failed.fetch_add(1, Relaxed);
                         continue;
                     }
                     let event = LogEvent {
@@ -57,9 +62,18 @@ pub async fn run_listener(
                     };
                     // Drop with a visible counter instead of silently stalling the socket forever.
                     match sender.try_send(event) {
-                        Ok(()) => {}
+                        Ok(()) => {
+                            metrics.queue_high_water.fetch_max(
+                                (sender.max_capacity() - sender.capacity()) as u64,
+                                Relaxed,
+                            );
+                        }
                         Err(mpsc::error::TrySendError::Closed(_)) => return,
                         Err(mpsc::error::TrySendError::Full(_)) => {
+                            metrics.notifications_dropped.fetch_add(1, Relaxed);
+                            metrics
+                                .queue_high_water
+                                .fetch_max(sender.max_capacity() as u64, Relaxed);
                             DROPPED_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     }

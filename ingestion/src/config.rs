@@ -10,6 +10,8 @@ const DEVNET_CLMM: &str = "DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH";
 
 #[derive(Clone)]
 pub struct Config {
+    pub max_fetch_concurrency: usize,
+    pub rpc_request_interval_ms: u64,
     pub cluster: String,
     pub http_url: String,
     pub ws_url: String,
@@ -53,10 +55,40 @@ pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
     };
 
     Ok(Config {
+        max_fetch_concurrency: setting("MAX_FETCH_CONCURRENCY", 8, 1, 64)? as usize,
+        rpc_request_interval_ms: setting("RPC_REQUEST_INTERVAL_MS", 100, 10, 10_000)?,
         cluster,
         http_url,
         ws_url,
         cpmm_program,
         clmm_program,
     })
+}
+
+fn setting(
+    name: &str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    parse_setting(env::var(name).ok().as_deref(), default, min, max)
+        .ok_or_else(|| format!("{name} must be an integer from {min} to {max}").into())
+}
+fn parse_setting(value: Option<&str>, default: u64, min: u64, max: u64) -> Option<u64> {
+    let n = match value {
+        Some(v) => v.parse().ok()?,
+        None => default,
+    };
+    (min..=max).contains(&n).then_some(n)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn concurrency_limits_reject_zero_and_unbounded_values() {
+        assert_eq!(parse_setting(None, 8, 1, 64), Some(8));
+        for v in ["0", "65", "-1", "secret", "999999999999999999999"] {
+            assert_eq!(parse_setting(Some(v), 8, 1, 64), None);
+        }
+    }
 }

@@ -6,7 +6,7 @@ use tokio::{
 };
 
 pub struct Persistence {
-    files: [BufWriter<File>; 4],
+    files: [BufWriter<File>; 5],
 }
 #[derive(Clone, Copy)]
 pub enum Stream {
@@ -14,6 +14,7 @@ pub enum Stream {
     Pools = 1,
     Unknown = 2,
     Momentum = 3,
+    Metrics = 4,
 }
 impl Persistence {
     pub async fn open(directory: &Path) -> io::Result<Self> {
@@ -29,10 +30,11 @@ impl Persistence {
         }
         Ok(Self {
             files: [
-                file(directory, "raydium_events_v11.jsonl").await?,
-                file(directory, "new_pairs_v11.jsonl").await?,
-                file(directory, "unknown_instructions_v11.jsonl").await?,
-                file(directory, "momentum_snapshots_v11.jsonl").await?,
+                file(directory, "raydium_events_v12.jsonl").await?,
+                file(directory, "new_pairs_v12.jsonl").await?,
+                file(directory, "unknown_instructions_v12.jsonl").await?,
+                file(directory, "momentum_snapshots_v12.jsonl").await?,
+                file(directory, "runtime_metrics_v12.jsonl").await?,
             ],
         })
     }
