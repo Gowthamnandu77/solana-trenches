@@ -86,6 +86,9 @@ impl Tracker {
             let Some(bucket) = ENDS.iter().position(|end| age >= 0.0 && age < *end as f64) else {
                 continue;
             };
+            if bucket < pool.next {
+                continue;
+            }
             let relevant: Vec<_> = records
                 .iter()
                 .filter(|r| r.protocol == pool.info.protocol && r.accounts.contains(address))
@@ -173,11 +176,11 @@ impl Pool {
             previous.map(|p| (STARTS[i] as f64 + elapsed - (STARTS[p] + ENDS[p]) as f64) / 2.0);
         let payers: HashSet<_> = self.buckets[..=i].iter().flat_map(|c| &c.payers).collect();
         json!({
-            "schema_version": 12, "protocol": self.info.protocol, "pool_state": self.info.pool_state,
+            "schema_version": 13, "protocol": self.info.protocol, "pool_state": self.info.pool_state,
             "token_mint_0": self.info.token_mint_0, "token_mint_1": self.info.token_mint_1,
             "creation_signature": self.signature, "creation_slot": self.slot,
             "creation_timestamp": self.block_time, "detected_at": self.detected_at,
-            "time_basis": "local_decoded_observation", "window_seconds": ENDS[i],
+            "time_basis": "local_notification_receipt", "window_seconds": ENDS[i],
             "interval_start_seconds": STARTS[i], "interval_end_seconds": elapsed,
             "complete": complete, "end_reason": if complete { "window_elapsed" } else { "shutdown" },
             "tx_count": counts.tx, "raydium_invocation_count": counts.invocations,

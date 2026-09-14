@@ -39,3 +39,15 @@ mod tests {
         assert!(!set.contains("first"));
     }
 }
+
+/// Shared by protocol listeners so routed signatures enter the queue only once.
+#[derive(Default)]
+pub struct EarlyDedup {
+    seen: HashSet<String>,
+    order: VecDeque<String>,
+}
+impl EarlyDedup {
+    pub fn admit(&mut self, signature: &str) -> bool {
+        remember_signature(signature, &mut self.seen, &mut self.order)
+    }
+}

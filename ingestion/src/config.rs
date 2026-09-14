@@ -11,6 +11,9 @@ const DEVNET_CLMM: &str = "DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH";
 #[derive(Clone)]
 pub struct Config {
     pub max_fetch_concurrency: usize,
+    pub input_queue_capacity: usize,
+    pub max_fetch_start_age_ms: u64,
+    pub max_momentum_event_age_ms: u64,
     pub rpc_request_interval_ms: u64,
     pub cluster: String,
     pub http_url: String,
@@ -55,8 +58,21 @@ pub fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
     };
 
     Ok(Config {
-        max_fetch_concurrency: setting("MAX_FETCH_CONCURRENCY", 8, 1, 64)? as usize,
-        rpc_request_interval_ms: setting("RPC_REQUEST_INTERVAL_MS", 100, 10, 10_000)?,
+        max_fetch_concurrency: setting(
+            "FETCH_CONCURRENCY",
+            setting("MAX_FETCH_CONCURRENCY", 8, 1, 64)?,
+            1,
+            64,
+        )? as usize,
+        input_queue_capacity: setting("INPUT_QUEUE_CAPACITY", 2000, 1, 100_000)? as usize,
+        max_fetch_start_age_ms: setting("MAX_FETCH_START_AGE_MS", 5000, 1, 300_000)?,
+        max_momentum_event_age_ms: setting("MAX_MOMENTUM_EVENT_AGE_MS", 5000, 1, 300_000)?,
+        rpc_request_interval_ms: setting(
+            "RPC_MIN_REQUEST_INTERVAL_MS",
+            setting("RPC_REQUEST_INTERVAL_MS", 100, 10, 10_000)?,
+            10,
+            10_000,
+        )?,
         cluster,
         http_url,
         ws_url,

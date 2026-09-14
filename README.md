@@ -162,3 +162,65 @@ Read-only, configured endpoint, default 8 jobs / 100ms shared request spacing, u
 V12 received 3,140 notifications, filtered 1,196 failed-transaction notifications, submitted 53 unique transactions, and filtered three duplicate notifications at dispatch. It made 52 HTTP attempts: 45 successful fetches and seven detected rate limits, including six retry attempts. No jobs exhausted retries. Mean HTTP-attempt latency was 210ms; peak actual HTTP concurrency was seven (configured job cap eight). Input/output queue high-water marks were 1,888/2,000 and 1/128. Shutdown cancelled eight pending jobs; current concurrency and active jobs returned to zero. All 45 event lines parsed as JSON.
 
 **Remaining bottleneck:** the configured RPC's rate limit dominates. The shared cooldown was active much of the run; the result queue stayed nearly empty while the input backlog grew. Mean notification-to-processing lag was 22.7 seconds and the last processed event lagged by 53.6 seconds. Zero drops in this sample is not sustainable coverage: the input queue was nearly full and queued notifications were discarded at shutdown. More concurrency cannot overcome this provider allowance; sustainable coverage requires an endpoint/rate budget that can serve the incoming unique transaction rate, or a separately designed narrower intake policy. This comparison used different live traffic at different times; the observed roughly 9% throughput increase is not a controlled speedup claim.
+
+## V13 freshness controls
+
+V13 preserves V12 decoding and adds shared listener deduplication before the bounded
+queue. Failed notifications are filtered before admission; no log-content filter
+is used. Local monotonic notification receipt defines momentum time, with half-open
+intervals [0,10), [10,30), [30,60). Late arrivals cannot rewrite emitted intervals.
+These are scanner observation windows, not exact on-chain first-second activity.
+
+`MAX_FETCH_START_AGE_MS=5000` skips work older than five seconds after the shared
+request gate, including retries. `MAX_MOMENTUM_EVENT_AGE_MS=5000` rejects momentum
+updates if local age or available block-time age exceeds five seconds. Decoded
+stale transactions remain persisted with a reason; stale-before-fetch work has a
+counter and no transaction body. Block time is second-resolution chain metadata;
+notification and processing timestamps are separate local wall-clock measurements.
+Monotonic clocks determine local age, so wall-clock corrections cannot change queue age.
+Missing block time cannot establish chain freshness.
+
+`FETCH_CONCURRENCY=8`, `RPC_MIN_REQUEST_INTERVAL_MS=100`, and
+`INPUT_QUEUE_CAPACITY=2000` control bounded resource usage. The previous
+`MAX_FETCH_CONCURRENCY` and `RPC_REQUEST_INTERVAL_MS` names remain fallback aliases.
+`SOLANA_WS_URL` and `SOLANA_HTTP_URL` independently configure intake and transaction
+fetching. URLs and provider error bodies are never printed. Defaults use public
+cluster endpoints; a dedicated RPC can improve coverage without changing the pipeline.
+
+Metrics include queue occupancy, oldest queued age, high-water, queue wait,
+fetch-start lag, processing lag, decoder and momentum durations, and stale counts.
+Latency histograms use 32 fixed logarithmic buckets: p50/p95 are approximate bucket
+upper bounds, max is measured. Memory does not grow with runtime.
+
+Root Cargo commands default to the `ingestion` package. The preserved Anchor counter
+example remains a separate workspace member; its LiteSVM integration test requires
+`target/deploy/solana_trenches.so` from an SBF build and is not part of scanner tests.
+Workspace formatting also normalized three existing counter-example files.
+
+### V13 Mainnet benchmark (2026-09-14)
+
+Read-only public Mainnet endpoint, 60 seconds, with the default V13 settings:
+fetch concurrency 8, 100ms minimum RPC spacing, and a 2,000-entry input queue.
+Both CPMM and CLMM listeners were active; the scanner exited cleanly after SIGINT
+and flushed valid JSONL.
+
+| Measurement | V13 |
+| --- | ---: |
+| Duration | 60.03s |
+| Processed transactions | 10 |
+| Decoded transactions | 3 |
+| Mentioned-only transactions | 7 |
+| Notifications received | 3,251 |
+| Failed notifications filtered | 1,285 |
+| Duplicates filtered | 230 |
+| Stale before fetch | 1,536 |
+| Stale before momentum | 10 |
+| Successful fetches / RPC attempts | 10 / 11 |
+| Rate limits / retries | 1 / 0 |
+| Notifications dropped | 0 |
+| Peak HTTP concurrency | 3 |
+| Input queue high-water | 296 |
+| Mean HTTP-attempt latency | 154.8ms |
+
+No new pool appeared in this sample. The final record reported eight cancelled
+jobs during shutdown; current jobs and active HTTP concurrency returned to zero.

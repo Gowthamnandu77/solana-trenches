@@ -24,6 +24,8 @@ pub struct FetchedEvent {
     pub log: LogEvent,
     pub transaction: serde_json::Value,
     pub block_time: Option<i64>,
+    pub fetch_started_unix_ms: i64,
+    pub fetch_completed_unix_ms: i64,
     pub slot: u64,
 }
 pub static FETCH_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -65,6 +67,9 @@ pub async fn run(
     output: mpsc::Sender<FetchedEvent>,
     metrics: Arc<Metrics>,
 ) {
+    metrics
+        .max_fetch_age_ms
+        .store(config.max_fetch_start_age_ms, Relaxed);
     let Ok(rpc) = HttpTransport::new(config.http_url) else {
         eprintln!("Unable to initialize HTTP client (details redacted)");
         return;
@@ -106,6 +111,13 @@ async fn dispatch<T: Transport>(
             Some(signature) = jobs.next(), if !jobs.is_empty() => { pending.remove(&signature); }
             event = input.recv(), if !input_closed && jobs.len() < limit => {
                 let Some(log) = event else { input_closed = true; continue; };
+                metrics.queued.lock().unwrap().remove(&log.signature);
+                metrics.queue_wait.observe(log.received_at.elapsed().as_millis() as u64);
+                let max_age = metrics.max_fetch_age_ms.load(Relaxed);
+                if max_age > 0 && log.received_at.elapsed().as_millis() > max_age as u128 {
+                    metrics.stale_before_fetch.fetch_add(1, Relaxed);
+                    continue;
+                }
                 if pending.contains(&log.signature) || !remember_signature(&log.signature, &mut seen, &mut queue) {
                     metrics.duplicates.fetch_add(1, Relaxed); continue;
                 }
@@ -129,9 +141,18 @@ async fn fetch_one<T: Transport>(
     let signature = log.signature.clone();
     for attempt in 0..5 {
         gate.acquire().await;
+        let age = log.received_at.elapsed().as_millis() as u64;
+        let max_age = metrics.max_fetch_age_ms.load(Relaxed);
+        if max_age > 0 && age > max_age {
+            metrics.stale_before_fetch.fetch_add(1, Relaxed);
+            job.finished = true;
+            return signature;
+        }
+        metrics.fetch_start_lag.observe(age);
         if attempt > 0 {
             metrics.retries.fetch_add(1, Relaxed);
         }
+        let fetch_started_unix_ms = chrono::Utc::now().timestamp_millis();
         let active = AttemptGuard::new(metrics.clone());
         let result = timeout(Duration::from_secs(12), rpc.fetch(&signature))
             .await
@@ -144,6 +165,8 @@ async fn fetch_one<T: Transport>(
                     .send(FetchedEvent {
                         log,
                         transaction: tx.json,
+                        fetch_started_unix_ms,
+                        fetch_completed_unix_ms: chrono::Utc::now().timestamp_millis(),
                         block_time: tx.block_time,
                         slot: tx.slot,
                     })
@@ -225,7 +248,24 @@ mod tests {
             slot: 1,
             logs: vec![],
             received_at: Instant::now(),
+            received_unix_ms: 0,
         }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn stale_queue_and_gate_wait_skip_rpc() {
+        let rpc = Arc::new(Mock::new(0, FetchError::Transient, Duration::ZERO));
+        let metrics = Arc::new(Metrics::default());
+        metrics.max_fetch_age_ms.store(100, Relaxed);
+        let (tx, rx) = mpsc::channel(2);
+        let (output, mut received) = mpsc::channel(2);
+        tx.send(event(1)).await.unwrap();
+        tokio::time::advance(Duration::from_millis(101)).await;
+        drop(tx);
+        dispatch(rpc.clone(), rx, output, 1, Duration::ZERO, metrics.clone()).await;
+        assert!(received.recv().await.is_none());
+        assert!(rpc.calls.lock().unwrap().is_empty());
+        assert_eq!(metrics.stale_before_fetch.load(Relaxed), 1);
+        assert_eq!(metrics.queue_wait.snapshot()["max"], 101);
     }
     #[tokio::test(start_paused = true)]
     async fn bounded_concurrency_duplicates_and_retry_deliver_each_transaction_once() {

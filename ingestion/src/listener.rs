@@ -18,6 +18,7 @@ pub struct LogEvent {
     pub slot: u64,
     pub logs: Vec<String>,
     pub received_at: Instant,
+    pub received_unix_ms: i64,
 }
 
 /// The supervisor cancels these tasks on shutdown, including pending connects/sends.
@@ -52,6 +53,10 @@ pub async fn run_listener(
                         metrics.notifications_failed.fetch_add(1, Relaxed);
                         continue;
                     }
+                    if !metrics.early_dedup.lock().unwrap().admit(&value.signature) {
+                        metrics.duplicates.fetch_add(1, Relaxed);
+                        continue;
+                    }
                     let event = LogEvent {
                         source: label,
                         program_id,
@@ -59,8 +64,12 @@ pub async fn run_listener(
                         slot: response.context.slot,
                         logs: value.logs,
                         received_at: Instant::now(),
+                        received_unix_ms: chrono::Utc::now().timestamp_millis(),
                     };
                     // Drop with a visible counter instead of silently stalling the socket forever.
+                    let signature = event.signature.clone();
+                    let mut queued = metrics.queued.lock().unwrap();
+                    queued.insert(signature.clone(), event.received_at);
                     match sender.try_send(event) {
                         Ok(()) => {
                             metrics.queue_high_water.fetch_max(
@@ -70,6 +79,7 @@ pub async fn run_listener(
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => return,
                         Err(mpsc::error::TrySendError::Full(_)) => {
+                            queued.remove(&signature);
                             metrics.notifications_dropped.fetch_add(1, Relaxed);
                             metrics
                                 .queue_high_water

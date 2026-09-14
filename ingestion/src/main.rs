@@ -1,6 +1,7 @@
 mod config;
 mod dedup;
 mod fetcher;
+mod freshness;
 mod listener;
 mod metrics;
 mod momentum;
@@ -30,7 +31,7 @@ type Error = Box<dyn std::error::Error>;
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let config = config::load_config()?;
-    println!("Solana Trenches — Raydium New Pool Momentum Tracker V12 (READ ONLY)");
+    println!("Solana Trenches — Raydium New Pool Momentum Tracker V13 (READ ONLY)");
     println!("Cluster: {}", config.cluster);
     // Manifest-relative path is stable whether run from the workspace or ingestion.
     let mut files = Persistence::open(&Path::new(env!("CARGO_MANIFEST_DIR")).join("data")).await?;
@@ -39,7 +40,7 @@ async fn main() -> Result<(), Error> {
         "Fetch concurrency={} request spacing={}ms",
         config.max_fetch_concurrency, config.rpc_request_interval_ms
     );
-    let (sender, receiver) = mpsc::channel(2000);
+    let (sender, receiver) = mpsc::channel(config.input_queue_capacity);
     let (fetched_sender, mut fetched_receiver) = mpsc::channel(128);
     let mut tasks = JoinSet::new();
     for (program, label) in [
@@ -131,7 +132,25 @@ async fn process(
     now: f64,
     metrics: &Metrics,
 ) -> Result<(), Error> {
+    let decode_start = Instant::now();
     let log = &fetched.log;
+    let observed_now = now - log.received_at.elapsed().as_secs_f64();
+    let local_age_ms = log.received_at.elapsed().as_millis() as u64;
+    let block_age_ms = fetched.block_time.map(|t| {
+        Utc::now()
+            .timestamp_millis()
+            .saturating_sub(t.saturating_mul(1000))
+            .max(0) as u64
+    });
+    let stale_reason =
+        freshness::stale_reason(local_age_ms, block_age_ms, config.max_momentum_event_age_ms);
+    let stale = stale_reason.is_some();
+    metrics.processing_lag.observe(local_age_ms);
+    if stale {
+        metrics
+            .stale_before_momentum
+            .fetch_add(1, Ordering::Relaxed);
+    }
     let records = raydium::collect_instruction_records(
         &fetched.transaction,
         config.cpmm_program,
@@ -142,6 +161,9 @@ async fn process(
         config.cpmm_program,
         config.clmm_program,
     );
+    metrics
+        .decode_latency
+        .observe(decode_start.elapsed().as_millis() as u64);
     let payer = raydium::fee_payer(&fetched.transaction);
     let source_invoked = raydium::program_invoked_in_logs(&log.logs, log.program_id);
     let cpmm_present = records.iter().any(|r| r.protocol == "raydium_cpmm");
@@ -168,14 +190,14 @@ async fn process(
     let timestamp = Utc::now().to_rfc3339();
     for record in records.iter().filter(|r| !r.known) {
         files.write(Stream::Unknown, &json!({
-            "schema_version": 12, "timestamp": timestamp, "cluster": config.cluster,
+            "schema_version": 13, "timestamp": timestamp, "cluster": config.cluster,
             "slot": fetched.slot, "signature": log.signature, "source": log.source,
             "protocol": record.protocol, "name": record.name, "discriminator": record.discriminator,
             "source_invoked": source_invoked
         })).await?;
     }
     files.write(Stream::Events, &json!({
-        "schema_version": 12, "timestamp": timestamp, "cluster": config.cluster,
+        "schema_version": 13, "timestamp": timestamp, "cluster": config.cluster,
         "block_time": fetched.block_time, "slot": fetched.slot, "notification_slot": log.slot,
         "signature": log.signature, "source": log.source, "source_invoked": source_invoked,
         "source_invoke_count": raydium::program_invoke_count(&log.logs, log.program_id),
@@ -184,19 +206,27 @@ async fn process(
         "multi_protocol_route": cpmm_present && clmm_present,
         "unknown_instruction_count": records.iter().filter(|r| !r.known).count(),
         "new_pool": !pools.is_empty(), "fee_payer": payer,
+        "notification_received_unix_ms": log.received_unix_ms,
+        "fetch_started_unix_ms": fetched.fetch_started_unix_ms,
+        "fetch_completed_unix_ms": fetched.fetch_completed_unix_ms,
+        "decoder_completed_unix_ms": Utc::now().timestamp_millis(),
+        "stale_before_momentum": stale,
+        "stale_reason": stale_reason,
+        "block_time_age_ms": block_age_ms,
         "notification_to_processing_seconds": log.received_at.elapsed().as_secs_f64()
     })).await?;
     for pool in pools {
-        let registered = tracker.register(
-            pool.clone(),
-            &log.signature,
-            fetched.slot,
-            fetched.block_time,
-            &timestamp,
-            now,
-        );
+        let registered = !stale
+            && tracker.register(
+                pool.clone(),
+                &log.signature,
+                fetched.slot,
+                fetched.block_time,
+                &timestamp,
+                observed_now,
+            );
         files.write(Stream::Pools, &json!({
-            "schema_version": 12, "detected_at": timestamp, "cluster": config.cluster,
+            "schema_version": 13, "detected_at": timestamp, "cluster": config.cluster,
             "block_time": fetched.block_time, "slot": fetched.slot, "signature": log.signature,
             "protocol": pool.protocol, "instruction": pool.instruction, "pool_state": pool.pool_state,
             "token_mint_0": pool.token_mint_0, "token_mint_1": pool.token_mint_1,
@@ -207,7 +237,13 @@ async fn process(
             pool.protocol, pool.pool_state
         );
     }
-    tracker.observe(&log.signature, payer.as_deref(), &records, now);
+    let momentum_start = Instant::now();
+    if !stale {
+        tracker.observe(&log.signature, payer.as_deref(), &records, observed_now);
+    }
+    metrics
+        .momentum_latency
+        .observe(momentum_start.elapsed().as_millis() as u64);
     println!(
         "[{}] status={status} instructions={names:?} multi_route={}",
         log.source,
@@ -220,11 +256,67 @@ async fn process(
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn stale_creation_persists_but_never_starts_momentum() {
+        let dir = std::env::temp_dir().join(format!("trenches-stale-{}", std::process::id()));
+        let mut files = Persistence::open(&dir).await.unwrap();
+        let config = Config {
+            max_fetch_concurrency: 1,
+            input_queue_capacity: 2,
+            rpc_request_interval_ms: 100,
+            max_fetch_start_age_ms: 5000,
+            max_momentum_event_age_ms: 5000,
+            cluster: "synthetic".into(),
+            http_url: String::new(),
+            ws_url: String::new(),
+            cpmm_program: "cp",
+            clmm_program: "cl",
+        };
+        let transaction = json!({"transaction":{"message":{"instructions":[{
+            "programId":"cl", "data":bs58::encode([233,146,209,142,207,104,64,188]).into_string(),
+            "accounts":["payer","config","pool","m0","m1"]}]}}});
+        let log = listener::LogEvent {
+            source: "raydium_clmm",
+            program_id: "cl",
+            signature: "stale".into(),
+            slot: 1,
+            logs: vec![],
+            received_at: Instant::now(),
+            received_unix_ms: 0,
+        };
+        let mut tracker = Tracker::default();
+        let metrics = Metrics::default();
+        process(
+            &config,
+            FetchedEvent {
+                log,
+                transaction,
+                block_time: Some(123),
+                slot: 1,
+                fetch_started_unix_ms: 0,
+                fetch_completed_unix_ms: 0,
+            },
+            &mut tracker,
+            &mut files,
+            0.0,
+            &metrics,
+        )
+        .await
+        .unwrap();
+        assert_eq!(metrics.stale_before_momentum.load(Ordering::Relaxed), 1);
+        assert!(tracker.advance(60.0).is_empty());
+        files.flush().await.unwrap();
+        drop(files);
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+    #[tokio::test]
     async fn synthetic_creation_route_and_snapshots_persist_as_jsonl() {
         let dir = std::env::temp_dir().join(format!("trenches-v12-test-{}", std::process::id()));
         let mut files = Persistence::open(&dir).await.unwrap();
         let config = Config {
             max_fetch_concurrency: 8,
+            input_queue_capacity: 2000,
+            max_fetch_start_age_ms: 5000,
+            max_momentum_event_age_ms: 5000,
             rpc_request_interval_ms: 100,
             cluster: "synthetic".into(),
             http_url: String::new(),
@@ -258,6 +350,7 @@ mod tests {
             slot: 42,
             logs: vec!["Program cl invoke [1]".into()],
             received_at: Instant::now(),
+            received_unix_ms: 0,
         };
         let mut tracker = Tracker::default();
         process(
@@ -265,7 +358,9 @@ mod tests {
             FetchedEvent {
                 log,
                 transaction,
-                block_time: Some(123),
+                fetch_started_unix_ms: 0,
+                fetch_completed_unix_ms: 0,
+                block_time: None,
                 slot: 42,
             },
             &mut tracker,
@@ -284,7 +379,7 @@ mod tests {
             ("unknown_instructions", 1),
             ("momentum_snapshots", 3),
         ] {
-            let data = tokio::fs::read_to_string(dir.join(format!("{name}_v12.jsonl")))
+            let data = tokio::fs::read_to_string(dir.join(format!("{name}_v13.jsonl")))
                 .await
                 .unwrap();
             assert!(data.ends_with('\n'));
@@ -315,7 +410,7 @@ async fn report_metrics(
     let mut value = metrics.snapshot();
     value["timestamp"] = json!(Utc::now().to_rfc3339());
     value["elapsed_seconds"] = json!(seconds);
-    value["schema_version"] = json!(12);
+    value["schema_version"] = json!(13);
     println!("METRICS {value}");
     files.write(Stream::Metrics, &value).await?;
     Ok(())
