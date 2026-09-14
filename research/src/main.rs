@@ -1,5 +1,6 @@
 use research::{
-    make_labeled, read_features, read_prices, score_report, write_jsonl, QualityDecision,
+    make_labeled, read_features, read_prices, score_report, write_jsonl, write_observations,
+    QualityDecision,
 };
 use std::{env, path::PathBuf, process::ExitCode};
 
@@ -10,6 +11,8 @@ fn main() -> ExitCode {
     let prices = argument(&args, "--prices").map(PathBuf::from);
     let output = argument(&args, "--output")
         .unwrap_or_else(|| "research/data/labeled_launches.jsonl".into());
+    let observations = argument(&args, "--observations")
+        .unwrap_or_else(|| "research/data/price_observations.jsonl".into());
     let rows = match read_features(&PathBuf::from(features)) {
         Ok(rows) => rows,
         Err(e) => {
@@ -33,6 +36,16 @@ fn main() -> ExitCode {
         },
         None => Vec::new(),
     };
+    if let Some(parent) = std::path::Path::new(&observations).parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("observations: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    if let Err(e) = write_observations(std::path::Path::new(&observations), &price_rows) {
+        eprintln!("observations: {e}");
+        return ExitCode::FAILURE;
+    }
     let labeled: Vec<_> = rows
         .into_iter()
         .map(|row| make_labeled(row, &price_rows))
@@ -52,10 +65,9 @@ fn main() -> ExitCode {
         .filter(|r| QualityDecision::Reject == research::quality_decision(&r.features))
         .count();
     println!(
-        "{}{}{}",
+        "{}quality_rejected={} dataset={output}",
         score_report(&labeled),
-        format!("quality_rejected={} ", rejected),
-        format!("dataset={output}")
+        rejected
     );
     ExitCode::SUCCESS
 }

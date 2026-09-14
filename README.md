@@ -373,8 +373,8 @@ observations remains unlabeled and is reported in coverage counts.
 The supported price input is deliberately explicit:
 
 ```text
-launch_account,timestamp_unix,price_quote_per_base,source
-POOL...,1700000000,0.00000123,onchain_reserves_or_verified_export
+protocol,launch_account,base_mint,quote_mint,timestamp_unix,slot,price_quote_per_base,source,source_quality
+raydium_cpmm,POOL...,BASE...,QUOTE...,1700000000,123,0.00000123,onchain_reserves_or_verified_export,derived_from_swaps
 ```
 
 The preferred source is an on-chain derived reserve or swap observation for the
@@ -419,3 +419,40 @@ modeled. The current repository contains no labeled historical samples, so it
 cannot support a predictive or profitability conclusion. The largest remaining
 limitation is obtaining a sufficiently complete, independently verified,
 timestamp-aligned on-chain price history across all supported pool types.
+
+## Phase 2 / P2 — Historical Data Acquisition
+
+P2 adds normalized `PriceObservation` records and an idempotent backfill path.
+The input price series is an explicit cache or export rather than a guessed
+quote. Each row carries protocol, pool/launch account, mints, timestamp, slot,
+price in quote per base, source, source quality, and whether it was observed or
+derived from swaps. Duplicate account/timestamp observations are collapsed
+deterministically, and normalized observations are persisted to
+`research/data/price_observations.jsonl`.
+
+The preferred acquisition source remains verified on-chain reserve or swap
+reconstruction. The current V15 records do not include raw token amounts or
+reserve state, and Raydium's public API documents pool metadata/current data
+rather than a complete historical per-pool series. P2 therefore accepts a
+provider-neutral normalized CSV produced by a separately verified exporter. No
+credential, provider-specific schema, interpolation, or fabricated price is
+hidden in the research crate. Rows without enough future observations remain
+`missing` or `partial` with an explicit reason.
+
+Backfill is resumable at the dataset boundary: the price CSV/JSONL cache can be
+reused after interruption, feature accounts are deduplicated, and the labeled
+JSONL is rewritten in logical content on each run rather than appended, so
+rerunning does not duplicate completed samples.
+
+```bash
+cargo run -p research -- backfill --features ingestion/data/features_v15.jsonl
+cargo run -p research -- backfill --features path/features_v15.jsonl --prices path/prices.csv
+```
+
+Labels use the first observation at or after creation as the reference price,
+then the latest observation at or before each target horizon. Returns are
+`P_horizon / P_reference - 1`; maximum return is the highest pointwise return,
+and maximum drawdown is the lowest `return - running peak` in the window. The
+tool reports `complete`, `partial`, or `missing`, while V15 scanner quality flags
+remain separate from price quality. There is no live collection mode yet:
+offline reproducibility and source auditability take priority.

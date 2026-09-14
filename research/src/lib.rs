@@ -9,12 +9,21 @@ use std::{
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct PricePoint {
+pub struct PriceObservation {
+    pub protocol: String,
     pub launch_account: String,
+    pub base_mint: Option<String>,
+    pub quote_mint: Option<String>,
     pub timestamp_unix: i64,
+    pub slot: Option<u64>,
     pub price_quote_per_base: f64,
     pub source: String,
+    pub source_quality: String,
+    pub observed: bool,
+    pub derived_from_swaps: bool,
 }
+
+pub type PricePoint = PriceObservation;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Outcome {
@@ -28,6 +37,10 @@ pub struct Outcome {
     pub max_drawdown_15m: Option<f64>,
     pub label_available: bool,
     pub price_data_source: Option<String>,
+    pub price_source_quality: Option<String>,
+    pub derived_from_swaps: bool,
+    pub label_status: String,
+    pub missing_data_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -71,32 +84,86 @@ pub fn parse_features<R: BufRead>(reader: R) -> io::Result<Vec<Value>> {
 }
 
 pub fn read_features(path: &Path) -> io::Result<Vec<Value>> {
-    parse_features(BufReader::new(File::open(path)?))
+    let rows = parse_features(BufReader::new(File::open(path)?))?;
+    let mut unique = BTreeMap::new();
+    for row in rows {
+        let key = row["launch_account"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let replace = unique
+            .get(&key)
+            .map(|old: &Value| {
+                row["complete_window"].as_bool().unwrap_or(false)
+                    && !old["complete_window"].as_bool().unwrap_or(false)
+            })
+            .unwrap_or(true);
+        if replace {
+            unique.insert(key, row);
+        }
+    }
+    Ok(unique.into_values().collect())
 }
 
-pub fn read_prices<R: BufRead>(reader: R) -> io::Result<Vec<PricePoint>> {
+pub fn read_prices<R: BufRead>(reader: R) -> io::Result<Vec<PriceObservation>> {
     let mut points = Vec::new();
     for (line_no, line) in reader.lines().enumerate() {
         let line = line?;
-        if line.trim().is_empty() || line.starts_with("launch_account,") {
+        if line.trim().is_empty()
+            || line.starts_with("launch_account,")
+            || line.starts_with("protocol,")
+        {
             continue;
         }
         let fields: Vec<_> = line.split(',').map(str::trim).collect();
-        if fields.len() != 4 {
+        if fields.len() != 4 && fields.len() != 9 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("price line {} needs 4 CSV fields", line_no + 1),
+                format!(
+                    "price line {} needs 4 legacy or 9 normalized CSV fields",
+                    line_no + 1
+                ),
             ));
         }
-        points.push(PricePoint {
-            launch_account: fields[0].to_owned(),
-            timestamp_unix: fields[1].parse().map_err(invalid_price)?,
-            price_quote_per_base: fields[2].parse().map_err(invalid_price)?,
-            source: fields[3].to_owned(),
-        });
+        let normalized = if fields.len() == 9 {
+            PriceObservation {
+                protocol: fields[0].into(),
+                launch_account: fields[1].into(),
+                base_mint: (!fields[2].is_empty()).then(|| fields[2].into()),
+                quote_mint: (!fields[3].is_empty()).then(|| fields[3].into()),
+                timestamp_unix: fields[4].parse().map_err(invalid_price)?,
+                slot: (!fields[5].is_empty())
+                    .then(|| fields[5].parse())
+                    .transpose()
+                    .map_err(invalid_price)?,
+                price_quote_per_base: fields[6].parse().map_err(invalid_price)?,
+                source: fields[7].into(),
+                source_quality: fields[8].into(),
+                observed: true,
+                derived_from_swaps: fields[8].contains("swap"),
+            }
+        } else {
+            PriceObservation {
+                protocol: "unknown".into(),
+                launch_account: fields[0].into(),
+                base_mint: None,
+                quote_mint: None,
+                timestamp_unix: fields[1].parse().map_err(invalid_price)?,
+                slot: None,
+                price_quote_per_base: fields[2].parse().map_err(invalid_price)?,
+                source: fields[3].into(),
+                source_quality: "unverified_import".into(),
+                observed: true,
+                derived_from_swaps: false,
+            }
+        };
+        points.push(normalized);
     }
     points.retain(|p| p.price_quote_per_base.is_finite() && p.price_quote_per_base > 0.0);
     points.sort_by_key(|p| (p.launch_account.clone(), p.timestamp_unix));
+    points.dedup_by(|a, b| {
+        a.launch_account == b.launch_account && a.timestamp_unix == b.timestamp_unix
+    });
     Ok(points)
 }
 
@@ -127,17 +194,24 @@ fn timestamp(value: &Value) -> Option<i64> {
 pub fn label_outcome(feature: &Value, prices: &[PricePoint]) -> Outcome {
     let account = feature["launch_account"].as_str().unwrap_or_default();
     let start = timestamp(feature);
-    let series: Vec<_> = prices
+    let mut series: Vec<_> = prices
         .iter()
         .filter(|p| p.launch_account == account)
         .collect();
+    series.sort_by_key(|p| p.timestamp_unix);
     let Some(start) = start else {
-        return unavailable(None);
+        return unavailable(None, None, false, Some("missing_creation_timestamp"));
     };
     let Some(base) = series.iter().find(|p| p.timestamp_unix >= start) else {
-        return unavailable(None);
+        return unavailable(
+            None,
+            None,
+            false,
+            Some("no_price_observation_at_or_after_creation"),
+        );
     };
     let source = Some(base.source.clone());
+    let source_quality = Some(base.source_quality.clone());
     let horizon = |seconds: i64| -> Option<f64> {
         series
             .iter()
@@ -176,10 +250,30 @@ pub fn label_outcome(feature: &Value, prices: &[PricePoint]) -> Outcome {
         max_drawdown_15m: w15.map(|w| w.1),
         label_available: horizon(300).is_some(),
         price_data_source: source,
+        price_source_quality: source_quality,
+        derived_from_swaps: base.derived_from_swaps,
+        label_status: if horizon(3600).is_some() {
+            "complete"
+        } else if horizon(300).is_some() {
+            "partial"
+        } else {
+            "missing"
+        }
+        .into(),
+        missing_data_reason: if horizon(300).is_some() && horizon(3600).is_none() {
+            Some("future_series_ends_before_1h".into())
+        } else {
+            None
+        },
     }
 }
 
-fn unavailable(source: Option<String>) -> Outcome {
+fn unavailable(
+    source: Option<String>,
+    source_quality: Option<String>,
+    derived_from_swaps: bool,
+    reason: Option<&str>,
+) -> Outcome {
     Outcome {
         return_1m: None,
         return_5m: None,
@@ -191,6 +285,10 @@ fn unavailable(source: Option<String>) -> Outcome {
         max_drawdown_15m: None,
         label_available: false,
         price_data_source: source,
+        price_source_quality: source_quality,
+        derived_from_swaps,
+        label_status: "missing".into(),
+        missing_data_reason: reason.map(str::to_owned),
     }
 }
 
@@ -304,6 +402,15 @@ pub fn write_jsonl(path: &Path, rows: &[LabeledLaunch]) -> io::Result<()> {
     Ok(())
 }
 
+pub fn write_observations(path: &Path, rows: &[PriceObservation]) -> io::Result<()> {
+    let mut file = File::create(path)?;
+    for row in rows {
+        serde_json::to_writer(&mut file, row).map_err(io::Error::other)?;
+        file.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
 pub fn score_report(rows: &[LabeledLaunch]) -> String {
     let labeled: Vec<_> = rows.iter().filter(|r| r.outcome.label_available).collect();
     let usable: Vec<_> = labeled
@@ -379,32 +486,61 @@ mod tests {
         assert_eq!(rows.len(), 1);
     }
     #[test]
+    fn parses_normalized_prices_and_deduplicates_timestamps() {
+        let csv = "protocol,launch_account,base_mint,quote_mint,timestamp_unix,slot,price_quote_per_base,source,source_quality\nraydium_cpmm,pool,base,quote,1000,7,10.0,onchain,derived_from_swaps\nraydium_cpmm,pool,base,quote,1000,7,11.0,onchain,derived_from_swaps\n";
+        let rows = read_prices(csv.as_bytes()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].slot, Some(7));
+        assert!(rows[0].derived_from_swaps);
+    }
+    #[test]
     fn labels_only_observations_at_or_before_horizons() {
         let prices = vec![
             PricePoint {
+                protocol: "raydium_cpmm".into(),
                 launch_account: "pool".into(),
+                base_mint: None,
+                quote_mint: None,
                 timestamp_unix: 1000,
+                slot: None,
                 price_quote_per_base: 10.0,
                 source: "onchain_fixture".into(),
+                source_quality: "derived_from_swaps".into(),
+                observed: true,
+                derived_from_swaps: true,
             },
             PricePoint {
+                protocol: "raydium_cpmm".into(),
                 launch_account: "pool".into(),
+                base_mint: None,
+                quote_mint: None,
                 timestamp_unix: 1060,
+                slot: None,
                 price_quote_per_base: 12.0,
                 source: "onchain_fixture".into(),
+                source_quality: "derived_from_swaps".into(),
+                observed: true,
+                derived_from_swaps: true,
             },
             PricePoint {
+                protocol: "raydium_cpmm".into(),
                 launch_account: "pool".into(),
+                base_mint: None,
+                quote_mint: None,
                 timestamp_unix: 1300,
+                slot: None,
                 price_quote_per_base: 9.0,
                 source: "onchain_fixture".into(),
+                source_quality: "derived_from_swaps".into(),
+                observed: true,
+                derived_from_swaps: true,
             },
         ];
         let outcome = label_outcome(&feature(), &prices);
-        assert_eq!(outcome.return_1m, Some(0.2));
-        assert_eq!(outcome.return_5m, Some(-0.1));
-        assert_eq!(outcome.max_return_5m, Some(0.2));
-        assert_eq!(outcome.max_drawdown_5m, Some(-0.3));
+        assert!((outcome.return_1m.unwrap() - 0.2).abs() < 1e-12);
+        assert!((outcome.return_5m.unwrap() + 0.1).abs() < 1e-12);
+        assert!((outcome.max_return_5m.unwrap() - 0.2).abs() < 1e-12);
+        assert!((outcome.max_drawdown_5m.unwrap() + 0.3).abs() < 1e-12);
     }
     #[test]
     fn bucketing_and_strategies_are_deterministic() {
