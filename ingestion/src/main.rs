@@ -175,14 +175,7 @@ async fn process(
     let log = &fetched.log;
     let observed_now = now - log.received_at.elapsed().as_secs_f64();
     let local_age_ms = log.received_at.elapsed().as_millis() as u64;
-    let block_age_ms = fetched.block_time.map(|t| {
-        Utc::now()
-            .timestamp_millis()
-            .saturating_sub(t.saturating_mul(1000))
-            .max(0) as u64
-    });
-    let stale_reason =
-        freshness::stale_reason(local_age_ms, block_age_ms, config.max_momentum_event_age_ms);
+    let stale_reason = freshness::stale_reason(local_age_ms, config.max_momentum_event_age_ms);
     let stale = stale_reason.is_some();
     metrics.processing_lag.observe(local_age_ms);
     if stale {
@@ -359,7 +352,7 @@ mod tests {
             input_queue_capacity: 2,
             rpc_request_interval_ms: 100,
             max_fetch_start_age_ms: 5000,
-            max_momentum_event_age_ms: 5000,
+            max_momentum_event_age_ms: 5,
             cluster: "synthetic".into(),
             http_url: String::new(),
             ws_url: String::new(),
@@ -377,7 +370,7 @@ mod tests {
             signature: "stale".into(),
             slot: 1,
             logs: vec![],
-            received_at: Instant::now(),
+            received_at: Instant::now() - Duration::from_millis(6),
             received_unix_ms: 0,
         };
         let mut tracker = Tracker::default();
@@ -387,7 +380,7 @@ mod tests {
             FetchedEvent {
                 log,
                 transaction,
-                block_time: Some(123),
+                block_time: Some(Utc::now().timestamp() - 60),
                 slot: 1,
                 fetch_started_unix_ms: 0,
                 fetch_completed_unix_ms: 0,
@@ -403,6 +396,67 @@ mod tests {
         assert!(tracker.advance(60.0).is_empty());
         files.flush().await.unwrap();
         drop(files);
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+    #[tokio::test]
+    async fn fresh_notification_with_delayed_block_time_registers_launch() {
+        let dir = std::env::temp_dir().join(format!("trenches-fresh-{}", std::process::id()));
+        let mut files = Persistence::open(&dir).await.unwrap();
+        let config = Config {
+            max_fetch_concurrency: 1,
+            input_queue_capacity: 2,
+            rpc_request_interval_ms: 100,
+            max_fetch_start_age_ms: 5000,
+            max_momentum_event_age_ms: 5000,
+            cluster: "synthetic".into(),
+            http_url: String::new(),
+            ws_url: String::new(),
+            cpmm_program: "cp",
+            clmm_program: "cl",
+            launchlab_program: None,
+            verbose: false,
+        };
+        let transaction = json!({"transaction":{"message":{"instructions":[{
+            "programId":"cl", "data":bs58::encode([233,146,209,142,207,104,64,188]).into_string(),
+            "accounts":["payer","config","pool","m0","m1"]}]}}});
+        let log = listener::LogEvent {
+            source: "raydium_clmm",
+            program_id: "cl",
+            signature: "fresh-after-confirmation".into(),
+            slot: 1,
+            logs: vec![],
+            received_at: Instant::now(),
+            received_unix_ms: Utc::now().timestamp_millis(),
+        };
+        let mut tracker = Tracker::default();
+        let metrics = Metrics::default();
+        process(
+            &config,
+            FetchedEvent {
+                log,
+                transaction,
+                // Reproduces the Helius evidence: a confirmed notification is
+                // locally fresh even though block time is more than five seconds old.
+                block_time: Some(Utc::now().timestamp() - 16),
+                slot: 1,
+                fetch_started_unix_ms: 0,
+                fetch_completed_unix_ms: 0,
+            },
+            &mut tracker,
+            &mut files,
+            0.0,
+            &metrics,
+        )
+        .await
+        .unwrap();
+        assert_eq!(metrics.stale_before_momentum.load(Ordering::Relaxed), 0);
+        assert_eq!(tracker.advance(10.0).len(), 1);
+        files.flush().await.unwrap();
+        let launches = tokio::fs::read_to_string(dir.join("new_launches_v15.jsonl"))
+            .await
+            .unwrap();
+        let launch: Value = serde_json::from_str(launches.trim()).unwrap();
+        assert_eq!(launch["tracker_registered"], true);
         tokio::fs::remove_dir_all(dir).await.unwrap();
     }
     #[tokio::test]
