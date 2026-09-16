@@ -643,4 +643,39 @@ mod tests {
                 .known
         );
     }
+
+    #[test]
+    fn launchlab_inner_initialize_is_collected_and_wrong_program_is_ignored() {
+        let launch_program = "launchlab-program";
+        let accounts = vec![
+            "payer",
+            "creator",
+            "config",
+            "platform",
+            "authority",
+            "launch",
+            "base",
+            "quote",
+        ];
+        let tx = json!({
+            "transaction": {"message": {"instructions": [
+                // The same discriminator from an unrelated program must not match.
+                ix("unrelated-program", LAUNCHLAB_INITIALIZE_V2, accounts.clone())
+            ]}},
+            "meta": {"innerInstructions": [{"instructions": [
+                ix(launch_program, LAUNCHLAB_INITIALIZE_V2, accounts)
+            ]}]}
+        });
+
+        let records = collect_instruction_records(&tx, "cp", "cl", Some(launch_program));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].protocol, "raydium_launchlab");
+        assert_eq!(records[0].name, "launchlab_initialize_v2");
+        assert_eq!(records[0].event_type, "launch_created");
+
+        let pools = detect_new_pools(&tx, "cp", "cl", Some(launch_program));
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].pool_state, "launch");
+        assert_eq!(pools[0].creator.as_deref(), Some("creator"));
+    }
 }

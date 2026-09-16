@@ -298,7 +298,9 @@ impl Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raydium::InstructionRecord;
+    use crate::{features, metrics::Metrics, raydium::InstructionRecord};
+    use serde_json::json;
+    use std::sync::atomic::Ordering::Relaxed;
     fn pool(address: &str) -> NewPoolInfo {
         NewPoolInfo {
             protocol: "raydium_cpmm",
@@ -399,6 +401,64 @@ mod tests {
             1
         );
     }
+
+    #[test]
+    fn tracker_emits_each_window_and_final_feature() {
+        let mut tracker = Tracker::default();
+        assert!(register(&mut tracker, "pool", 0.0));
+
+        // This signature is observed twice but must count only once in [0, 10).
+        tracker.observe("first", Some("alice"), &[record("pool", true)], 1.0);
+        tracker.observe("first", Some("alice"), &[record("pool", true)], 2.0);
+        let ten_seconds = tracker.advance(10.0);
+        assert_eq!(ten_seconds.len(), 1);
+        assert_eq!(ten_seconds[0]["tx_count"], 1);
+        assert_eq!(ten_seconds[0]["swap_count"], 1);
+        assert_eq!(ten_seconds[0]["window_seconds"], 10);
+        assert_eq!(ten_seconds[0]["complete"], true);
+        assert!(tracker.take_features().is_empty());
+
+        tracker.observe("second", Some("bob"), &[record("pool", true)], 10.0);
+        let thirty_seconds = tracker.advance(30.0);
+        assert_eq!(thirty_seconds[0]["tx_count"], 1);
+        assert_eq!(thirty_seconds[0]["window_seconds"], 30);
+        assert_eq!(thirty_seconds[0]["complete"], true);
+        assert!(tracker.take_features().is_empty());
+
+        tracker.observe("third", Some("carol"), &[record("pool", true)], 30.0);
+        let sixty_seconds = tracker.advance(60.0);
+        assert_eq!(sixty_seconds[0]["tx_count"], 1);
+        assert_eq!(sixty_seconds[0]["window_seconds"], 60);
+        assert_eq!(sixty_seconds[0]["complete"], true);
+
+        let features = tracker.take_features();
+        assert_eq!(features.len(), 1);
+        assert_eq!(features[0]["tx_counts_10_30_60s"], json!([1, 1, 1]));
+        assert_eq!(features[0]["swap_counts_10_30_60s"], json!([1, 1, 1]));
+        assert_eq!(features[0]["complete_window"], true);
+    }
+
+    #[test]
+    fn completed_feature_gets_explicit_runtime_quality_flags() {
+        let mut tracker = Tracker::default();
+        assert!(register(&mut tracker, "pool", 0.0));
+        tracker.observe("swap", Some("payer"), &[record("pool", true)], 1.0);
+        tracker.advance(60.0);
+        let mut feature = tracker.take_features().pop().unwrap();
+        assert_eq!(feature["complete_window"], true);
+
+        let metrics = Metrics::default();
+        metrics.rate_limits.fetch_add(1, Relaxed);
+        features::apply_quality_flags(&mut feature, false, &metrics);
+
+        assert_eq!(feature["approximate_trader_identity"], true);
+        assert_eq!(feature["rpc_rate_limited"], true);
+        assert_eq!(feature["partial_protocol_coverage"], false);
+        assert_eq!(feature["quality_flags"]["complete_window"], true);
+        assert_eq!(feature["quality_flags"]["rpc_rate_limited"], true);
+        assert_eq!(feature["quality_flags"]["scanner_drop_observed"], false);
+    }
+
     #[test]
     fn windows_dedup_swaps_payers_acceleration_and_score() {
         let mut t = Tracker::default();

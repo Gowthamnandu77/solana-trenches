@@ -313,6 +313,48 @@ mod tests {
         assert_eq!(evicted.len(), 4);
         assert_eq!(metrics.attempts.load(Relaxed), 1);
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn fresh_rate_limited_event_retries_and_delivers_once() {
+        // The first mock call returns a 429-style error; the second succeeds.
+        let rpc = Arc::new(Mock::new(
+            1,
+            FetchError::RateLimited(Duration::from_secs(1)),
+            Duration::ZERO,
+        ));
+        let metrics = Arc::new(Metrics::default());
+        let input = Arc::new(FreshQueue::new(1, 60_000));
+        let (output, mut received) = mpsc::channel(1);
+        let expected_signature = event(7).signature;
+        input.push(LogEvent {
+            signature: expected_signature.clone(),
+            ..event(7)
+        });
+        input.close();
+
+        dispatch(
+            rpc.clone(),
+            input,
+            output,
+            1,
+            Duration::ZERO,
+            metrics.clone(),
+        )
+        .await;
+
+        assert_eq!(
+            received.recv().await.unwrap().log.signature,
+            expected_signature
+        );
+        assert!(received.recv().await.is_none(), "event was delivered twice");
+        assert_eq!(rpc.calls.lock().unwrap()[&expected_signature], 2);
+        assert_eq!(metrics.attempts.load(Relaxed), 2);
+        assert_eq!(metrics.retries.load(Relaxed), 1);
+        assert_eq!(metrics.rate_limits.load(Relaxed), 1);
+        assert_eq!(metrics.successes.load(Relaxed), 1);
+        assert_eq!(metrics.failures.load(Relaxed), 0);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn bounded_concurrency_duplicates_and_retry_deliver_each_transaction_once() {
         let rpc = Arc::new(Mock::new(1, FetchError::Transient, Duration::from_secs(1)));

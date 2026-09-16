@@ -459,6 +459,79 @@ mod tests {
         assert_eq!(launch["tracker_registered"], true);
         tokio::fs::remove_dir_all(dir).await.unwrap();
     }
+
+    #[tokio::test]
+    async fn shutdown_persists_one_partial_snapshot_and_feature_as_jsonl() {
+        let dir = std::env::temp_dir().join(format!("trenches-shutdown-{}", std::process::id()));
+        let mut files = Persistence::open(&dir).await.unwrap();
+        let config = Config {
+            max_fetch_concurrency: 1,
+            input_queue_capacity: 1,
+            rpc_request_interval_ms: 100,
+            max_fetch_start_age_ms: 5000,
+            max_momentum_event_age_ms: 5000,
+            cluster: "synthetic".into(),
+            http_url: String::new(),
+            ws_url: String::new(),
+            cpmm_program: "cp",
+            clmm_program: "cl",
+            launchlab_program: None,
+            verbose: false,
+        };
+        let mut tracker = Tracker::default();
+        assert!(tracker.register_with_lag(
+            raydium::NewPoolInfo {
+                protocol: "raydium_cpmm",
+                instruction: "initialize",
+                pool_state: "active-pool".into(),
+                token_mint_0: "base".into(),
+                token_mint_1: "quote".into(),
+                creator: None,
+            },
+            "creation",
+            1,
+            None,
+            "test",
+            0,
+            0.0,
+        ));
+
+        let metrics = Metrics::default();
+        let partial_snapshots = tracker.shutdown(5.0);
+        assert_eq!(partial_snapshots.len(), 1);
+        assert_eq!(partial_snapshots[0]["complete"], false);
+        assert_eq!(partial_snapshots[0]["end_reason"], "shutdown");
+        snapshots(&mut files, partial_snapshots, &metrics)
+            .await
+            .unwrap();
+        features(&mut files, tracker.take_features(), &config, &metrics)
+            .await
+            .unwrap();
+        files.flush().await.unwrap();
+        drop(files);
+
+        let snapshot_rows: Vec<Value> =
+            tokio::fs::read_to_string(dir.join("momentum_snapshots_v15.jsonl"))
+                .await
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(snapshot_rows.len(), 1);
+        assert_eq!(snapshot_rows[0]["complete"], false);
+        assert_eq!(snapshot_rows[0]["end_reason"], "shutdown");
+
+        let feature_rows: Vec<Value> = tokio::fs::read_to_string(dir.join("features_v15.jsonl"))
+            .await
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(feature_rows.len(), 1);
+        assert_eq!(feature_rows[0]["complete_window"], false);
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
     #[tokio::test]
     async fn synthetic_creation_route_and_snapshots_persist_as_jsonl() {
         let dir = std::env::temp_dir().join(format!("trenches-v12-test-{}", std::process::id()));
