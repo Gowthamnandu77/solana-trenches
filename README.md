@@ -387,7 +387,8 @@ provider or use credentials. External providers can be converted to this CSV
 through a separately audited adapter.
 
 Outcome definitions use the first price at or after creation as the baseline,
-then use the latest observation at or before each horizon. Returns are
+then use the latest observation at or before each horizon, only when the
+series also extends to that horizon. Returns are
 `price_horizon / baseline - 1`. Maximum return is the greatest pointwise return
 inside the window. Maximum drawdown is the lowest `return - running_peak` in the
 window. Horizons are 1m, 5m, 15m, and 1h; maximum return and drawdown are
@@ -448,10 +449,22 @@ sorts and deduplicates by launch account plus timestamp, then rewrites
 it does not duplicate observations, labels, or ordering. The tool never
 fabricates prices.
 
+`validate-prices` provides a preflight check, and `backfill` enforces the same
+offline gate. It accepts only the normalized nine-column form; it requires a known
+launch account, matching protocol and mints, an observation at or after the
+launch timestamp, a finite positive price, and non-empty `source` plus
+`source_quality`. The supplied provenance fields are preserved in each
+`PriceObservation` and therefore in its label. Unknown or unverifiable rows
+are rejected rather than silently imported.
+
 ```bash
 cargo run -p research -- backfill \
   --features ingestion/data/features_v15.jsonl \
   --prices path/prices.csv
+
+cargo run -p research -- validate-prices \
+  --features ingestion/data/features_v15.jsonl \
+  --prices path/verified_price_export.csv
 
 cargo run -p research -- backfill \
   --features path/features_v15.jsonl \
@@ -461,7 +474,8 @@ cargo run -p research -- backfill \
 ```
 
 Labels use the first observation at or after creation as the reference price,
-then the latest observation at or before each target horizon. Returns are
+then the latest observation at or before each target horizon, provided the
+series has reached that horizon. Returns are
 `P_horizon / P_reference - 1`; maximum return is the highest pointwise return,
 and maximum drawdown is the lowest `return - running peak` in the window. The
 tool reports `complete`, `partial`, or `missing`, while V15 scanner quality flags

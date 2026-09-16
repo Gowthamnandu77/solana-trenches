@@ -1,6 +1,7 @@
 use research::{
     backtest, inventory, make_labeled, merge_observations, parse_features, read_features,
-    read_observations, read_prices, score_report, write_jsonl, write_observations, QualityDecision,
+    read_observations, read_price_export, read_prices, score_report, validate_price_export,
+    write_jsonl, write_observations, QualityDecision,
 };
 use std::{
     env,
@@ -26,6 +27,9 @@ fn main() -> ExitCode {
     }
     if args.get(1).map(String::as_str) == Some("backfill") {
         return backfill_command(&args);
+    }
+    if args.get(1).map(String::as_str) == Some("validate-prices") {
+        return validate_prices_command(&args);
     }
     let features =
         argument(&args, "--features").unwrap_or_else(|| "ingestion/data/features_v15.jsonl".into());
@@ -95,9 +99,54 @@ fn main() -> ExitCode {
 
 fn help_command() -> ExitCode {
     println!(
-        "Usage:\n  research [--features PATH] [--prices PATH] [--observations PATH] [--output PATH]\n  research inventory [--features PATH]\n  research backfill --features PATH --prices PATH [--observations PATH] [--output PATH]\n  research backtest --features PATH --prices PATH [--report PATH] [--fee-per-side RATE] [--slippage-per-side RATE]"
+        "Usage:\n  research [--features PATH] [--prices PATH] [--observations PATH] [--output PATH]\n  research inventory [--features PATH]\n  research validate-prices --features PATH --prices PATH\n  research backfill --features PATH --prices PATH [--observations PATH] [--output PATH]\n  research backtest --features PATH --prices PATH [--report PATH] [--fee-per-side RATE] [--slippage-per-side RATE]"
     );
     ExitCode::SUCCESS
+}
+
+fn validate_prices_command(args: &[String]) -> ExitCode {
+    let feature_path =
+        argument(args, "--features").unwrap_or_else(|| "ingestion/data/features_v15.jsonl".into());
+    let Some(price_path) = argument(args, "--prices") else {
+        eprintln!("validate-prices requires --prices PATH");
+        return ExitCode::FAILURE;
+    };
+    let features = match read_features(PathBuf::from(feature_path).as_path()) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("features: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let imported = match File::open(price_path) {
+        Ok(file) => match read_price_export(BufReader::new(file)) {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("prices: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        Err(e) => {
+            eprintln!("prices: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let imported_count = imported.len();
+    match validate_price_export(&features, imported) {
+        Ok(validated) => {
+            println!(
+                "validated_price_observations={} normalized_unique_observations={} target_launches={}",
+                imported_count,
+                validated.len(),
+                features.len()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("prices: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn backfill_command(args: &[String]) -> ExitCode {
@@ -119,7 +168,7 @@ fn backfill_command(args: &[String]) -> ExitCode {
         }
     };
     let imported = match File::open(price_path) {
-        Ok(file) => match read_prices(BufReader::new(file)) {
+        Ok(file) => match read_price_export(BufReader::new(file)) {
             Ok(rows) => rows,
             Err(e) => {
                 eprintln!("prices: {e}");
@@ -146,6 +195,13 @@ fn backfill_command(args: &[String]) -> ExitCode {
         }
     };
     let imported_count = imported.len();
+    let imported = match validate_price_export(&features, imported) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("prices: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let existing_count = existing.len();
     let merged = merge_observations(existing, imported);
     if let Some(parent) = std::path::Path::new(&observations).parent() {

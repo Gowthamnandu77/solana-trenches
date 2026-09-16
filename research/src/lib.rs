@@ -106,6 +106,17 @@ pub fn read_features(path: &Path) -> io::Result<Vec<Value>> {
 }
 
 pub fn read_prices<R: BufRead>(reader: R) -> io::Result<Vec<PriceObservation>> {
+    Ok(normalize_observations(read_price_csv(reader, false)?))
+}
+
+pub fn read_price_export<R: BufRead>(reader: R) -> io::Result<Vec<PriceObservation>> {
+    read_price_csv(reader, true)
+}
+
+fn read_price_csv<R: BufRead>(
+    reader: R,
+    normalized_only: bool,
+) -> io::Result<Vec<PriceObservation>> {
     let mut points = Vec::new();
     for (line_no, line) in reader.lines().enumerate() {
         let line = line?;
@@ -123,6 +134,12 @@ pub fn read_prices<R: BufRead>(reader: R) -> io::Result<Vec<PriceObservation>> {
                     "price line {} needs 4 legacy or 9 normalized CSV fields",
                     line_no + 1
                 ),
+            ));
+        }
+        if normalized_only && fields.len() != 9 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("price line {} needs 9 normalized CSV fields", line_no + 1),
             ));
         }
         let normalized = if fields.len() == 9 {
@@ -159,7 +176,83 @@ pub fn read_prices<R: BufRead>(reader: R) -> io::Result<Vec<PriceObservation>> {
         };
         points.push(normalized);
     }
-    Ok(normalize_observations(points))
+    Ok(points)
+}
+
+pub fn validate_price_export(
+    features: &[Value],
+    observations: Vec<PriceObservation>,
+) -> io::Result<Vec<PriceObservation>> {
+    let mut targets = BTreeMap::new();
+    for feature in features {
+        let account = feature["launch_account"].as_str().unwrap_or_default();
+        if account.is_empty() {
+            continue;
+        }
+        targets.insert(
+            account,
+            (
+                feature["protocol"].as_str().unwrap_or_default(),
+                feature["base_mint"].as_str(),
+                feature["quote_mint"].as_str(),
+                timestamp(feature),
+            ),
+        );
+    }
+    for (row_no, observation) in observations.iter().enumerate() {
+        let line_no = row_no + 2;
+        if !observation.price_quote_per_base.is_finite() || observation.price_quote_per_base <= 0.0
+        {
+            return Err(invalid_export(
+                line_no,
+                "price_quote_per_base must be finite and > 0",
+            ));
+        }
+        if observation.source.trim().is_empty() {
+            return Err(invalid_export(line_no, "source must be non-empty"));
+        }
+        if observation.source_quality.trim().is_empty() {
+            return Err(invalid_export(line_no, "source_quality must be non-empty"));
+        }
+        let Some((protocol, base_mint, quote_mint, creation_time)) =
+            targets.get(observation.launch_account.as_str())
+        else {
+            return Err(invalid_export(
+                line_no,
+                "launch_account is not in the feature target set",
+            ));
+        };
+        if observation.protocol != *protocol {
+            return Err(invalid_export(
+                line_no,
+                "protocol does not match the feature target",
+            ));
+        }
+        if observation.base_mint.as_deref() != *base_mint
+            || observation.quote_mint.as_deref() != *quote_mint
+        {
+            return Err(invalid_export(
+                line_no,
+                "mints do not match the feature target",
+            ));
+        }
+        if let Some(creation_time) = creation_time {
+            if observation.timestamp_unix < *creation_time {
+                return Err(invalid_export(
+                    line_no,
+                    "timestamp is before the launch creation baseline",
+                ));
+            }
+        }
+    }
+    Ok(normalize_observations(observations))
+}
+
+fn invalid_export(line_no: usize, message: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("price export line {line_no}: {message}"),
+    )
 }
 
 pub fn read_observations<R: BufRead>(reader: R) -> io::Result<Vec<PriceObservation>> {
@@ -241,6 +334,9 @@ pub fn label_outcome(feature: &Value, prices: &[PricePoint]) -> Outcome {
     let source = Some(base.source.clone());
     let source_quality = Some(base.source_quality.clone());
     let horizon = |seconds: i64| -> Option<f64> {
+        if !series.iter().any(|p| p.timestamp_unix >= start + seconds) {
+            return None;
+        }
         series
             .iter()
             .rev()
@@ -265,8 +361,8 @@ pub fn label_outcome(feature: &Value, prices: &[PricePoint]) -> Outcome {
             Some((peak, drawdown))
         }
     };
-    let w5 = window(300);
-    let w15 = window(900);
+    let w5 = horizon(300).and_then(|_| window(300));
+    let w15 = horizon(900).and_then(|_| window(900));
     Outcome {
         return_1m: horizon(60),
         return_5m: horizon(300),
@@ -858,6 +954,61 @@ raydium_cpmm,pool,base,quote,1000,1,99.0,imported_fixture,observed\n".as_bytes()
     }
 
     #[test]
+    fn validated_price_export_flows_from_target_to_cache_to_label() {
+        let csv = "protocol,launch_account,base_mint,quote_mint,timestamp_unix,slot,price_quote_per_base,source,source_quality\n\
+raydium_cpmm,pool,base,quote,1000,1,100.0,verified_fixture,observed\n\
+raydium_cpmm,pool,base,quote,1000,1,999.0,verified_fixture,observed\n\
+raydium_cpmm,pool,base,quote,1060,2,110.0,verified_fixture,observed\n\
+raydium_cpmm,pool,base,quote,1300,3,120.0,verified_fixture,observed\n\
+raydium_cpmm,pool,base,quote,1900,4,90.0,verified_fixture,observed\n\
+raydium_cpmm,pool,base,quote,4600,5,150.0,verified_fixture,observed\n";
+        let imported = read_price_export(csv.as_bytes()).unwrap();
+        let validated = validate_price_export(&[feature()], imported).unwrap();
+        assert_eq!(validated.len(), 5);
+        assert_eq!(validated[0].price_quote_per_base, 100.0);
+
+        let cached = merge_observations(Vec::new(), validated);
+        let labeled = make_labeled(feature(), &cached);
+        assert_eq!(labeled.outcome.label_status, "complete");
+        assert_eq!(
+            labeled.outcome.price_data_source.as_deref(),
+            Some("verified_fixture")
+        );
+    }
+
+    #[test]
+    fn price_export_validation_rejects_unknown_invalid_and_unprovenanced_rows() {
+        let valid = PriceObservation {
+            protocol: "raydium_cpmm".into(),
+            launch_account: "pool".into(),
+            base_mint: Some("base".into()),
+            quote_mint: Some("quote".into()),
+            timestamp_unix: 1000,
+            slot: Some(1),
+            price_quote_per_base: 10.0,
+            source: "fixture".into(),
+            source_quality: "observed".into(),
+            observed: true,
+            derived_from_swaps: false,
+        };
+        let mut unknown = valid.clone();
+        unknown.launch_account = "unknown".into();
+        assert!(validate_price_export(&[feature()], vec![unknown]).is_err());
+
+        let mut invalid_price = valid.clone();
+        invalid_price.price_quote_per_base = 0.0;
+        assert!(validate_price_export(&[feature()], vec![invalid_price]).is_err());
+
+        let mut missing_source = valid.clone();
+        missing_source.source.clear();
+        assert!(validate_price_export(&[feature()], vec![missing_source]).is_err());
+
+        let mut missing_quality = valid.clone();
+        missing_quality.source_quality.clear();
+        assert!(validate_price_export(&[feature()], vec![missing_quality]).is_err());
+    }
+
+    #[test]
     fn labels_only_observations_at_or_before_horizons() {
         let prices = vec![
             PricePoint {
@@ -905,6 +1056,11 @@ raydium_cpmm,pool,base,quote,1000,1,99.0,imported_fixture,observed\n".as_bytes()
         assert!((outcome.return_5m.unwrap() + 0.1).abs() < 1e-12);
         assert!((outcome.max_return_5m.unwrap() - 0.2).abs() < 1e-12);
         assert!((outcome.max_drawdown_5m.unwrap() + 0.3).abs() < 1e-12);
+        assert_eq!(outcome.label_status, "partial");
+        assert_eq!(
+            outcome.missing_data_reason.as_deref(),
+            Some("future_series_ends_before_1h")
+        );
     }
 
     #[test]
