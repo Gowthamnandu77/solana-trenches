@@ -1,4 +1,5 @@
 pub mod derive;
+pub mod fetch;
 pub mod paper;
 
 use serde::{Deserialize, Serialize};
@@ -948,17 +949,49 @@ mod tests {
     }
 
     fn token_balance(index: u64, mint: &str, amount: &str) -> Value {
-        serde_json::json!({"accountIndex":index,"mint":mint,"uiTokenAmount":{"amount":amount,"decimals":6}})
+        let owner = matches!(index, 1 | 3).then_some("payer").unwrap_or("pool");
+        serde_json::json!({"accountIndex":index,"mint":mint,"owner":owner,"uiTokenAmount":{"amount":amount,"decimals":6}})
     }
 
     fn launchlab_transaction(program: &str, launch: &str) -> Value {
         let data = bs58::encode([250, 234, 13, 123, 213, 156, 19, 236]).into_string();
         serde_json::json!({
             "slot":7,"blockTime":1060,
-            "transaction":{"signatures":["fixture_signature"],"message":{"accountKeys":["payer","base_user","base_vault","quote_user","quote_vault","launch"],"instructions":[{"programId":program,"accounts":["payer","a","b","c",launch],"data":data}]}},
+            "transaction":{"signatures":["fixture_signature"],"message":{"accountKeys":["payer","base_user","base_vault","quote_user","quote_vault","launch","extra_a","extra_b","extra_c"],"instructions":[{"programId":program,"accounts":["payer","extra_a","extra_b","extra_c",launch,"base_user","quote_user","base_vault","quote_vault"],"data":data}]}},
             "meta":{"err":null,
                 "preTokenBalances":[token_balance(1,"base","2000000"),token_balance(2,"base","0"),token_balance(3,"quote","0"),token_balance(4,"quote","10000000")],
                 "postTokenBalances":[token_balance(1,"base","0"),token_balance(2,"base","2000000"),token_balance(3,"quote","10000000"),token_balance(4,"quote","0")]}
+        })
+    }
+
+    fn launchlab_transfer_transaction() -> Value {
+        let discriminator = [149, 39, 222, 155, 211, 124, 152, 26];
+        let mut data = discriminator.to_vec();
+        data.extend_from_slice(&2_000_000u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        let encoded = bs58::encode(data).into_string();
+        let transfer = |source: &str, destination: &str, mint: &str, amount: &str| {
+            serde_json::json!({
+                "program": "spl-token",
+                "parsed": {"type": "transferChecked", "info": {
+                    "source": source, "destination": destination, "mint": mint,
+                    "tokenAmount": {"amount": amount, "decimals": 6}
+                }}
+            })
+        };
+        serde_json::json!({
+            "slot": 8, "blockTime": 1061,
+            "transaction": {"signatures": ["transfer_fixture_signature"], "message": {
+                "accountKeys": ["payer", "launch", "base_source", "base_mid", "base_vault", "quote_source", "quote_mid", "quote_vault", "fee_account"],
+                "instructions": [{"programId": "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj", "accounts": ["payer", "payer", "payer", "payer", "launch", "base_source", "quote_source", "base_vault", "quote_vault"], "data": encoded}]
+            }},
+            "meta": {"err": null, "innerInstructions": [{"index": 0, "instructions": [
+                transfer("base_source", "base_mid", "base", "2000000"),
+                transfer("base_mid", "base_vault", "base", "2000000"),
+                transfer("quote_source", "quote_mid", "quote", "10000000"),
+                transfer("quote_mid", "quote_vault", "quote", "10000000"),
+                transfer("quote_source", "fee_account", "quote", "100000")
+            ]}]}
         })
     }
 
@@ -974,11 +1007,92 @@ mod tests {
         assert!((observations[0].price_quote_per_base - 5.0).abs() < 1e-12);
         assert_eq!(
             observations[0].source_quality,
-            "verified_launchlab_balance_deltas"
+            "verified_launchlab_instruction_scoped_balance_deltas"
         );
         assert_eq!(
             observations[0].source_tx_signature.as_deref(),
             Some("fixture_signature")
+        );
+    }
+
+    #[test]
+    fn derives_launchlab_price_from_instruction_scoped_transfers_with_fee_movement() {
+        let transaction = launchlab_transfer_transaction();
+        let (observations, summary) = derive::derive_prices(&[launchlab_feature()], &[transaction]);
+        assert_eq!(summary.unique_observations, 1);
+        assert_eq!(summary.rejected_ambiguous, 0);
+        assert!((observations[0].price_quote_per_base - 5.0).abs() < 1e-12);
+        assert_eq!(
+            observations[0].source_quality,
+            "verified_launchlab_instruction_scoped_token_transfers"
+        );
+        assert_eq!(
+            observations[0].source_tx_signature.as_deref(),
+            Some("transfer_fixture_signature")
+        );
+    }
+
+    #[test]
+    fn launchlab_derivation_scopes_extra_movements_and_account_creation() {
+        let program = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj";
+        let mut extra = launchlab_transaction(program, "launch");
+        extra["meta"]["preTokenBalances"]
+            .as_array_mut()
+            .unwrap()
+            .push(token_balance(9, "quote", "1000000"));
+        extra["meta"]["postTokenBalances"]
+            .as_array_mut()
+            .unwrap()
+            .push(token_balance(9, "quote", "9000000"));
+        let (observations, summary) = derive::derive_prices(&[launchlab_feature()], &[extra]);
+        assert_eq!(summary.unique_observations, 1);
+        assert!((observations[0].price_quote_per_base - 5.0).abs() < 1e-12);
+
+        let mut created = launchlab_transaction(program, "launch");
+        created["meta"]["preTokenBalances"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|row| row["accountIndex"] != 3);
+        assert_eq!(
+            derive::derive_prices(&[launchlab_feature()], &[created])
+                .0
+                .len(),
+            1
+        );
+
+        let mut ambiguous = launchlab_transaction(program, "launch");
+        ambiguous["transaction"]["message"]["instructions"][0]["accounts"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|account| account != "quote_vault");
+        assert_eq!(
+            derive::derive_prices(&[launchlab_feature()], &[ambiguous])
+                .1
+                .rejected_ambiguous,
+            1
+        );
+
+        let mut wrong_mint = launchlab_transaction(program, "launch");
+        let mut wrong_feature = launchlab_feature();
+        wrong_feature["base_mint"] = "wrong".into();
+        assert_eq!(
+            derive::derive_prices(&[wrong_feature], &[wrong_mint.take()])
+                .1
+                .rejected_ambiguous,
+            1
+        );
+
+        let mut multiple = launchlab_transaction(program, "launch");
+        let second = multiple["transaction"]["message"]["instructions"][0].clone();
+        multiple["transaction"]["message"]["instructions"]
+            .as_array_mut()
+            .unwrap()
+            .push(second);
+        assert_eq!(
+            derive::derive_prices(&[launchlab_feature()], &[multiple])
+                .1
+                .rejected_ambiguous,
+            1
         );
     }
 
@@ -1028,14 +1142,10 @@ mod tests {
         );
 
         let mut ambiguous = launchlab_transaction(program, "launch");
-        ambiguous["meta"]["preTokenBalances"]
+        ambiguous["transaction"]["message"]["instructions"][0]["accounts"]
             .as_array_mut()
             .unwrap()
-            .push(token_balance(8, "base", "1"));
-        ambiguous["meta"]["postTokenBalances"]
-            .as_array_mut()
-            .unwrap()
-            .push(token_balance(8, "base", "2"));
+            .retain(|account| account != "quote_vault");
         assert_eq!(
             derive::derive_prices(&[launchlab_feature()], &[ambiguous])
                 .1

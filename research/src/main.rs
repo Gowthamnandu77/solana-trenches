@@ -35,6 +35,9 @@ fn main() -> ExitCode {
     if args.get(1).map(String::as_str) == Some("derive-prices") {
         return derive_prices_command(&args);
     }
+    if args.get(1).map(String::as_str) == Some("fetch-transactions") {
+        return fetch_transactions_command(&args);
+    }
     if args.get(1).map(String::as_str) == Some("paper-trade") {
         return paper_trade_command(&args);
     }
@@ -106,9 +109,90 @@ fn main() -> ExitCode {
 
 fn help_command() -> ExitCode {
     println!(
-        "Usage:\n  research [--features PATH] [--prices PATH] [--observations PATH] [--output PATH]\n  research inventory [--features PATH]\n  research validate-prices --features PATH --prices PATH\n  research derive-prices --features PATH --transactions PATH [--output PATH]\n  research backfill --features PATH --prices PATH [--observations PATH] [--output PATH]\n  research backtest --features PATH --prices PATH [--report PATH] [--fee-per-side RATE] [--slippage-per-side RATE]\n  research paper-trade --features PATH [--output PATH] [--metrics PATH] [--score-threshold N] [--holding-seconds 60|300|900|3600] [--starting-capital N] [--position-size N] [--fee-per-side RATE] [--slippage-per-side RATE]"
+        "Usage:\n  research [--features PATH] [--prices PATH] [--observations PATH] [--output PATH]\n  research inventory [--features PATH]\n  research validate-prices --features PATH --prices PATH\n  research derive-prices --features PATH --transactions PATH [--output PATH]\n  research fetch-transactions --features PATH [--target-index N] [--output-dir PATH] [--max-pages N] [--page-size N] [--signatures-only]\n  research backfill --features PATH --prices PATH [--observations PATH] [--output PATH]\n  research backtest --features PATH --prices PATH [--report PATH] [--fee-per-side RATE] [--slippage-per-side RATE]\n  research paper-trade --features PATH [--output PATH] [--metrics PATH] [--score-threshold N] [--holding-seconds 60|300|900|3600] [--starting-capital N] [--position-size N] [--fee-per-side RATE] [--slippage-per-side RATE]"
     );
     ExitCode::SUCCESS
+}
+
+fn fetch_transactions_command(args: &[String]) -> ExitCode {
+    let feature_path =
+        argument(args, "--features").unwrap_or_else(|| "ingestion/data/features_v15.jsonl".into());
+    let target_index = argument(args, "--target-index")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let max_pages = argument(args, "--max-pages")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=20).contains(value))
+        .unwrap_or(8);
+    let page_size = argument(args, "--page-size")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=100).contains(value))
+        .unwrap_or(50);
+    let fetch_transactions = !args.iter().any(|arg| arg == "--signatures-only");
+    let output_dir =
+        argument(args, "--output-dir").unwrap_or_else(|| "research/data/raw_transactions".into());
+    let features = match read_features(PathBuf::from(feature_path).as_path()) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("features: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let targets: Vec<_> = features
+        .iter()
+        .filter(|row| row["protocol"].as_str() == Some("raydium_launchlab"))
+        .filter_map(|row| {
+            Some((
+                row["launch_account"].as_str()?,
+                row["block_time"]
+                    .as_i64()
+                    .or_else(|| row["creation_time_unix"].as_i64())?,
+            ))
+        })
+        .collect();
+    let Some((account, creation_time)) = targets.get(target_index).copied() else {
+        eprintln!("fetch-transactions target-index is outside the LaunchLab target set");
+        return ExitCode::FAILURE;
+    };
+    let url = match research::fetch::configured_rpc_url() {
+        Ok(url) => url,
+        Err(e) => {
+            eprintln!("fetch-transactions: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let output = PathBuf::from(output_dir).join(format!("{account}.jsonl"));
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            eprintln!("fetch-transactions: could not start read-only runtime");
+            return ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(research::fetch::fetch_target(
+        url,
+        account,
+        creation_time,
+        &output,
+        research::fetch::FetchOptions {
+            max_pages,
+            page_size,
+            fetch_transactions,
+        },
+    )) {
+        Ok(summary) => {
+            println!("{}", serde_json::to_string(&summary).unwrap());
+            if summary.rpc_failures == 0 && summary.window_complete {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(e) => {
+            eprintln!("fetch-transactions: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn derive_prices_command(args: &[String]) -> ExitCode {

@@ -535,6 +535,8 @@ cargo run -p research -- paper-trade \
 
 The CLI prints `PAPER SIMULATION ONLY — NO LIVE TRADES`. Tiny samples are
 exploratory only; the backtest stays chronological and uses no random shuffle.
+The repository currently has no real historical observations or labels, so it
+does not make a real backtest or paper-simulation performance claim.
 
 ## Phase 2 / P3 — Real Dataset Collection and Evaluation
 

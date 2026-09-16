@@ -3,9 +3,11 @@
 use crate::{normalize_observations, timestamp, PriceObservation};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const LAUNCHLAB_PROGRAM: &str = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj";
+const BUY_EXACT_IN: [u8; 8] = [250, 234, 13, 123, 213, 156, 19, 236];
+const SELL_EXACT_IN: [u8; 8] = [149, 39, 222, 155, 211, 124, 152, 26];
 const SWAP_DISCRIMINATORS: [[u8; 8]; 4] = [
     [250, 234, 13, 123, 213, 156, 19, 236],
     [24, 211, 116, 40, 105, 3, 153, 56],
@@ -102,15 +104,32 @@ fn derive_one(
     if swaps.len() != 1 {
         return Err(Reject::Ambiguous);
     }
-    let launch_account = &swaps[0];
-    let Some((protocol, base_mint, quote_mint, _)) = targets.get(launch_account) else {
+    let launch_account = &swaps[0].launch_account;
+    let Some((protocol, base_mint, quote_mint, _creation_time)) = targets.get(launch_account)
+    else {
         return Err(Reject::UnknownTarget);
     };
     if protocol != "raydium_launchlab" {
         return Err(Reject::UnknownTarget);
     }
-    let base = exchanged_amount(tx, base_mint)?;
-    let quote = exchanged_amount(tx, quote_mint)?;
+    let payer = account_keys.first().ok_or(Reject::Malformed)?;
+    let (base, quote, source_quality) =
+        match transfer_price(tx, &swaps[0], base_mint, quote_mint, &account_keys)? {
+            Some((base, quote)) => (
+                base,
+                quote,
+                "verified_launchlab_instruction_scoped_token_transfers",
+            ),
+            None => {
+                let base = exchanged_amount(tx, base_mint, &swaps[0].account_indices, payer)?;
+                let quote = exchanged_amount(tx, quote_mint, &swaps[0].account_indices, payer)?;
+                (
+                    base,
+                    quote,
+                    "verified_launchlab_instruction_scoped_balance_deltas",
+                )
+            }
+        };
     let price_quote_per_base = quote / base;
     if !price_quote_per_base.is_finite() || price_quote_per_base <= 0.0 {
         return Err(Reject::Malformed);
@@ -124,7 +143,7 @@ fn derive_one(
         slot: Some(slot),
         price_quote_per_base,
         source: "solana_transaction_export".into(),
-        source_quality: "verified_launchlab_balance_deltas".into(),
+        source_quality: source_quality.into(),
         source_tx_signature,
         observed: true,
         derived_from_swaps: true,
@@ -157,7 +176,15 @@ fn instructions(tx: &Value) -> impl Iterator<Item = &Value> {
         )
 }
 
-fn launchlab_swap(instruction: &Value, account_keys: &[String]) -> Option<String> {
+struct SwapReference {
+    launch_account: String,
+    account_indices: BTreeSet<u64>,
+    discriminator: [u8; 8],
+}
+
+type Balance = (i128, u8, Option<String>);
+
+fn launchlab_swap(instruction: &Value, account_keys: &[String]) -> Option<SwapReference> {
     let program = instruction["programId"]
         .as_str()
         .map(str::to_owned)
@@ -177,55 +204,251 @@ fn launchlab_swap(instruction: &Value, account_keys: &[String]) -> Option<String
     }
     let accounts = instruction["accounts"].as_array()?;
     let target = accounts.get(4)?;
-    target.as_str().map(str::to_owned).or_else(|| {
+    let launch_account = target.as_str().map(str::to_owned).or_else(|| {
         target
             .as_u64()
             .and_then(|index| account_keys.get(index as usize).cloned())
+    })?;
+    Some(SwapReference {
+        launch_account,
+        account_indices: accounts
+            .iter()
+            .filter_map(|account| {
+                account.as_u64().or_else(|| {
+                    account
+                        .as_str()
+                        .and_then(|key| account_keys.iter().position(|candidate| candidate == key))
+                        .map(|index| index as u64)
+                })
+            })
+            .collect(),
+        discriminator: data[..8].try_into().ok()?,
     })
 }
 
-fn exchanged_amount(tx: &Value, mint: &str) -> Result<f64, Reject> {
-    let pre = balances(tx, "/meta/preTokenBalances", mint)?;
-    let post = balances(tx, "/meta/postTokenBalances", mint)?;
-    if pre.len() != 2 || post.len() != 2 {
+fn transfer_price(
+    tx: &Value,
+    swap: &SwapReference,
+    base_mint: &str,
+    quote_mint: &str,
+    account_keys: &[String],
+) -> Result<Option<(f64, f64)>, Reject> {
+    let input_mint = if swap.discriminator == BUY_EXACT_IN {
+        quote_mint
+    } else if swap.discriminator == SELL_EXACT_IN {
+        base_mint
+    } else {
+        return Err(Reject::Ambiguous);
+    };
+    let base = transfer_amounts(tx, base_mint, &swap.account_indices, account_keys)?;
+    let quote = transfer_amounts(tx, quote_mint, &swap.account_indices, account_keys)?;
+    if base.is_empty() && quote.is_empty() {
+        return Ok(None);
+    }
+    let data = instructions(tx)
+        .find_map(|instruction| {
+            launchlab_instruction_data(instruction, swap.discriminator, account_keys)
+        })
+        .ok_or(Reject::Malformed)?;
+    let input_raw = u64::from_le_bytes(
+        data.get(8..16)
+            .ok_or(Reject::Malformed)?
+            .try_into()
+            .map_err(|_| Reject::Malformed)?,
+    ) as u128;
+    if input_raw == 0 {
         return Err(Reject::Ambiguous);
     }
-    let mut deltas = Vec::new();
-    for (index, (before, decimals)) in pre {
-        let Some((after, post_decimals)) = post.get(&index) else {
-            return Err(Reject::Ambiguous);
-        };
-        if decimals != *post_decimals {
-            return Err(Reject::Malformed);
-        }
-        deltas.push((after - before, decimals));
-    }
-    if deltas.len() != 2 || deltas[0].1 != deltas[1].1 {
-        return Err(Reject::Ambiguous);
-    }
-    let positive: i128 = deltas
+    let input = if input_mint == base_mint {
+        &base
+    } else {
+        &quote
+    };
+    let output = if input_mint == base_mint {
+        &quote
+    } else {
+        &base
+    };
+    let input_matches: Vec<_> = input
         .iter()
-        .filter(|(delta, _)| *delta > 0)
-        .map(|(delta, _)| *delta)
-        .sum();
-    let negative: i128 = deltas
-        .iter()
-        .filter(|(delta, _)| *delta < 0)
-        .map(|(delta, _)| -*delta)
-        .sum();
-    if positive == 0 || positive != negative {
+        .filter(|(amount, _)| *amount == input_raw)
+        .collect();
+    if input_matches.is_empty() {
         return Err(Reject::Ambiguous);
     }
-    Ok(positive as f64 / 10_f64.powi(deltas[0].1 as i32))
+    let output_amount = unique_repeated_amount(output)?;
+    let input_decimals = input_matches
+        .iter()
+        .map(|(_, decimals)| *decimals)
+        .collect::<BTreeSet<_>>();
+    if input_decimals.len() != 1 {
+        return Err(Reject::Malformed);
+    }
+    let input_value = input_raw as f64 / 10_f64.powi(*input_decimals.iter().next().unwrap() as i32);
+    let output_value = output_amount.0 as f64 / 10_f64.powi(output_amount.1 as i32);
+    if input_value <= 0.0
+        || output_value <= 0.0
+        || !input_value.is_finite()
+        || !output_value.is_finite()
+    {
+        return Err(Reject::Malformed);
+    }
+    if input_mint == base_mint {
+        Ok(Some((input_value, output_value)))
+    } else {
+        Ok(Some((output_value, input_value)))
+    }
 }
 
-fn balances(tx: &Value, path: &str, mint: &str) -> Result<BTreeMap<u64, (i128, u8)>, Reject> {
+fn launchlab_instruction_data(
+    instruction: &Value,
+    discriminator: [u8; 8],
+    account_keys: &[String],
+) -> Option<Vec<u8>> {
+    let program = instruction["programId"].as_str().or_else(|| {
+        instruction["programIdIndex"]
+            .as_u64()
+            .and_then(|index| account_keys.get(index as usize).map(String::as_str))
+    })?;
+    if program != LAUNCHLAB_PROGRAM {
+        return None;
+    }
+    let data = bs58::decode(instruction["data"].as_str()?)
+        .into_vec()
+        .ok()?;
+    (data.get(..8) == Some(discriminator.as_slice())).then_some(data)
+}
+
+fn transfer_amounts(
+    tx: &Value,
+    mint: &str,
+    account_indices: &BTreeSet<u64>,
+    account_keys: &[String],
+) -> Result<Vec<(u128, u8)>, Reject> {
+    let mut amounts = Vec::new();
+    for instruction in instructions(tx) {
+        if instruction["program"] != "spl-token" {
+            continue;
+        }
+        let Some(info) = instruction["parsed"]["info"].as_object() else {
+            continue;
+        };
+        if instruction["parsed"]["type"].as_str() != Some("transferChecked")
+            || info.get("mint").and_then(Value::as_str) != Some(mint)
+        {
+            continue;
+        }
+        let source = info["source"].as_str().and_then(|value| {
+            account_keys
+                .iter()
+                .position(|key| key == value)
+                .map(|index| index as u64)
+        });
+        let destination = info["destination"].as_str().and_then(|value| {
+            account_keys
+                .iter()
+                .position(|key| key == value)
+                .map(|index| index as u64)
+        });
+        if !source.is_some_and(|index| account_indices.contains(&index))
+            && !destination.is_some_and(|index| account_indices.contains(&index))
+        {
+            continue;
+        }
+        let amount = info["tokenAmount"]["amount"]
+            .as_str()
+            .ok_or(Reject::Malformed)?
+            .parse()
+            .map_err(|_| Reject::Malformed)?;
+        let decimals = info["tokenAmount"]["decimals"]
+            .as_u64()
+            .and_then(|value| u8::try_from(value).ok())
+            .ok_or(Reject::Malformed)?;
+        if amount == 0 {
+            return Err(Reject::Ambiguous);
+        }
+        amounts.push((amount, decimals));
+    }
+    Ok(amounts)
+}
+
+fn unique_repeated_amount(amounts: &[(u128, u8)]) -> Result<(u128, u8), Reject> {
+    let mut counts = BTreeMap::new();
+    for amount in amounts {
+        *counts.entry(*amount).or_insert(0usize) += 1;
+    }
+    let Some((&best, &count)) = counts.iter().max_by_key(|(_, count)| **count) else {
+        return Err(Reject::Ambiguous);
+    };
+    if counts.values().filter(|value| **value == count).count() != 1 {
+        return Err(Reject::Ambiguous);
+    }
+    Ok(best)
+}
+
+fn exchanged_amount(
+    tx: &Value,
+    mint: &str,
+    account_indices: &BTreeSet<u64>,
+    payer: &str,
+) -> Result<f64, Reject> {
+    let pre = balances(tx, "/meta/preTokenBalances", mint, account_indices)?;
+    let post = balances(tx, "/meta/postTokenBalances", mint, account_indices)?;
+    let indices: BTreeSet<_> = pre.keys().chain(post.keys()).copied().collect();
+    if indices.len() < 2 {
+        return Err(Reject::Ambiguous);
+    }
+    let user_indices: Vec<_> = indices
+        .iter()
+        .filter(|index| {
+            pre.get(index).and_then(|(_, _, owner)| owner.as_deref()) == Some(payer)
+                || post.get(index).and_then(|(_, _, owner)| owner.as_deref()) == Some(payer)
+        })
+        .collect();
+    if user_indices.len() != 1 {
+        return Err(Reject::Ambiguous);
+    }
+    let index = *user_indices[0];
+    let (before, decimals, pre_owner) = match pre.get(&index) {
+        Some((amount, decimals, owner)) => (*amount, *decimals, owner.clone()),
+        None => {
+            let Some((_, decimals, _)) = post.get(&index) else {
+                return Err(Reject::Malformed);
+            };
+            (0, *decimals, None)
+        }
+    };
+    let (after, post_decimals, post_owner) = match post.get(&index) {
+        Some((amount, decimals, owner)) => (*amount, *decimals, owner.clone()),
+        None => (0, decimals, None),
+    };
+    if decimals != post_decimals || pre_owner.as_deref().or(post_owner.as_deref()) != Some(payer) {
+        return Err(Reject::Malformed);
+    }
+    let delta = after - before;
+    if delta == 0 {
+        return Err(Reject::Ambiguous);
+    }
+    Ok(delta.unsigned_abs() as f64 / 10_f64.powi(decimals as i32))
+}
+
+fn balances(
+    tx: &Value,
+    path: &str,
+    mint: &str,
+    account_indices: &BTreeSet<u64>,
+) -> Result<BTreeMap<u64, Balance>, Reject> {
     let rows = tx
         .pointer(path)
         .and_then(Value::as_array)
         .ok_or(Reject::Malformed)?;
     rows.iter()
-        .filter(|row| row["mint"].as_str() == Some(mint))
+        .filter(|row| {
+            row["mint"].as_str() == Some(mint)
+                && row["accountIndex"]
+                    .as_u64()
+                    .is_some_and(|index| account_indices.contains(&index))
+        })
         .map(|row| {
             let index = row["accountIndex"].as_u64().ok_or(Reject::Malformed)?;
             let amount = row["uiTokenAmount"]["amount"]
@@ -237,7 +460,10 @@ fn balances(tx: &Value, path: &str, mint: &str) -> Result<BTreeMap<u64, (i128, u
                 .as_u64()
                 .and_then(|value| u8::try_from(value).ok())
                 .ok_or(Reject::Malformed)?;
-            Ok((index, (amount, decimals)))
+            Ok((
+                index,
+                (amount, decimals, row["owner"].as_str().map(str::to_owned)),
+            ))
         })
         .collect()
 }
