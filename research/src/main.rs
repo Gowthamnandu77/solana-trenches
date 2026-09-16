@@ -1,7 +1,8 @@
 use research::{
     backtest, inventory, make_labeled, merge_observations, parse_features, read_features,
-    read_observations, read_price_export, read_prices, score_report, validate_price_export,
-    write_jsonl, write_observations, QualityDecision,
+    read_jsonl_values, read_labeled, read_observations, read_price_export, read_prices,
+    score_report, validate_price_export, write_jsonl, write_observations, write_serialized_jsonl,
+    QualityDecision,
 };
 use std::{
     env,
@@ -30,6 +31,12 @@ fn main() -> ExitCode {
     }
     if args.get(1).map(String::as_str) == Some("validate-prices") {
         return validate_prices_command(&args);
+    }
+    if args.get(1).map(String::as_str) == Some("derive-prices") {
+        return derive_prices_command(&args);
+    }
+    if args.get(1).map(String::as_str) == Some("paper-trade") {
+        return paper_trade_command(&args);
     }
     let features =
         argument(&args, "--features").unwrap_or_else(|| "ingestion/data/features_v15.jsonl".into());
@@ -99,7 +106,122 @@ fn main() -> ExitCode {
 
 fn help_command() -> ExitCode {
     println!(
-        "Usage:\n  research [--features PATH] [--prices PATH] [--observations PATH] [--output PATH]\n  research inventory [--features PATH]\n  research validate-prices --features PATH --prices PATH\n  research backfill --features PATH --prices PATH [--observations PATH] [--output PATH]\n  research backtest --features PATH --prices PATH [--report PATH] [--fee-per-side RATE] [--slippage-per-side RATE]"
+        "Usage:\n  research [--features PATH] [--prices PATH] [--observations PATH] [--output PATH]\n  research inventory [--features PATH]\n  research validate-prices --features PATH --prices PATH\n  research derive-prices --features PATH --transactions PATH [--output PATH]\n  research backfill --features PATH --prices PATH [--observations PATH] [--output PATH]\n  research backtest --features PATH --prices PATH [--report PATH] [--fee-per-side RATE] [--slippage-per-side RATE]\n  research paper-trade --features PATH [--output PATH] [--metrics PATH] [--score-threshold N] [--holding-seconds 60|300|900|3600] [--starting-capital N] [--position-size N] [--fee-per-side RATE] [--slippage-per-side RATE]"
+    );
+    ExitCode::SUCCESS
+}
+
+fn derive_prices_command(args: &[String]) -> ExitCode {
+    let feature_path =
+        argument(args, "--features").unwrap_or_else(|| "ingestion/data/features_v15.jsonl".into());
+    let Some(transaction_path) = argument(args, "--transactions") else {
+        eprintln!("derive-prices requires --transactions PATH");
+        return ExitCode::FAILURE;
+    };
+    let output = argument(args, "--output")
+        .unwrap_or_else(|| "research/data/derived_price_observations.jsonl".into());
+    let features = match read_features(PathBuf::from(feature_path).as_path()) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("features: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let transactions = match File::open(transaction_path)
+        .map(BufReader::new)
+        .and_then(|reader| read_jsonl_values(reader, "transaction"))
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("transactions: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (observations, summary) = research::derive::derive_prices(&features, &transactions);
+    if let Some(parent) = std::path::Path::new(&output).parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("output: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    if let Err(e) = write_observations(std::path::Path::new(&output), &observations) {
+        eprintln!("output: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("{}", serde_json::to_string(&summary).unwrap());
+    ExitCode::SUCCESS
+}
+
+fn paper_trade_command(args: &[String]) -> ExitCode {
+    let Some(feature_path) = argument(args, "--features") else {
+        eprintln!("paper-trade requires --features PATH to labeled_launches.jsonl");
+        return ExitCode::FAILURE;
+    };
+    let parse = |flag: &str, default: f64| {
+        argument(args, flag)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let holding_seconds = argument(args, "--holding-seconds")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(300);
+    if !matches!(holding_seconds, 60 | 300 | 900 | 3600) {
+        eprintln!("paper-trade holding-seconds must be 60, 300, 900, or 3600");
+        return ExitCode::FAILURE;
+    }
+    let config = research::paper::PaperConfig {
+        strategy_version: "score_quality_horizon_v1".into(),
+        score_threshold: parse("--score-threshold", 60.0),
+        holding_seconds,
+        starting_capital: parse("--starting-capital", 10_000.0),
+        position_size: parse("--position-size", 100.0),
+        fee_per_side: parse("--fee-per-side", 0.0),
+        slippage_per_side: parse("--slippage-per-side", 0.0),
+    };
+    if let Err(e) = config.validate() {
+        eprintln!("paper-trade {e}");
+        return ExitCode::FAILURE;
+    }
+    let rows = match read_labeled(std::path::Path::new(&feature_path)) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("features: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let output =
+        argument(args, "--output").unwrap_or_else(|| "research/data/paper_trades.jsonl".into());
+    let metrics_path =
+        argument(args, "--metrics").unwrap_or_else(|| "research/data/paper_metrics.jsonl".into());
+    let (trades, metrics) = match research::paper::simulate(&rows, &config) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("paper-trade {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    for path in [&output, &metrics_path] {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!("output: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    if let Err(e) = write_serialized_jsonl(std::path::Path::new(&output), &trades) {
+        eprintln!("output: {e}");
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = write_serialized_jsonl(
+        std::path::Path::new(&metrics_path),
+        std::slice::from_ref(&metrics),
+    ) {
+        eprintln!("metrics: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "PAPER SIMULATION ONLY — NO LIVE TRADES\n{}",
+        serde_json::to_string(&metrics).unwrap()
     );
     ExitCode::SUCCESS
 }
@@ -118,8 +240,12 @@ fn validate_prices_command(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let imported = match File::open(price_path) {
-        Ok(file) => match read_price_export(BufReader::new(file)) {
+    let imported = match File::open(&price_path) {
+        Ok(file) => match if price_path.ends_with(".jsonl") {
+            read_observations(BufReader::new(file))
+        } else {
+            read_price_export(BufReader::new(file))
+        } {
             Ok(rows) => rows,
             Err(e) => {
                 eprintln!("prices: {e}");
@@ -167,8 +293,12 @@ fn backfill_command(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let imported = match File::open(price_path) {
-        Ok(file) => match read_price_export(BufReader::new(file)) {
+    let imported = match File::open(&price_path) {
+        Ok(file) => match if price_path.ends_with(".jsonl") {
+            read_observations(BufReader::new(file))
+        } else {
+            read_price_export(BufReader::new(file))
+        } {
             Ok(rows) => rows,
             Err(e) => {
                 eprintln!("prices: {e}");
@@ -290,19 +420,26 @@ fn backtest_command(args: &[String]) -> ExitCode {
         }
     };
     let prices = match price_path {
-        Some(path) => match read_prices(BufReader::new(match File::open(path) {
-            Ok(file) => file,
-            Err(e) => {
-                eprintln!("prices: {e}");
-                return ExitCode::FAILURE;
+        Some(path) => {
+            let file = match File::open(&path) {
+                Ok(file) => file,
+                Err(e) => {
+                    eprintln!("prices: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match if path.ends_with(".jsonl") {
+                read_observations(BufReader::new(file))
+            } else {
+                read_prices(BufReader::new(file))
+            } {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("prices: {e}");
+                    return ExitCode::FAILURE;
+                }
             }
-        })) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("prices: {e}");
-                return ExitCode::FAILURE;
-            }
-        },
+        }
         None => Vec::new(),
     };
     let mut labels: Vec<_> = features

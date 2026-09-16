@@ -13,3 +13,4 @@ wallets/
 **/data/*.jsonl
 ingestion/data/*.jsonl
 research/data/*.jsonl
+research/data/raw_transactions/

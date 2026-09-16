@@ -482,6 +482,52 @@ tool reports `complete`, `partial`, or `missing`, while V15 scanner quality flag
 remain separate from price quality. There is no live collection mode yet:
 offline reproducibility and source auditability take priority.
 
+### Offline transaction derivation and paper simulation
+
+`derive-prices` is an offline, fail-closed adapter for locally exported Solana
+transaction JSONL. It recognizes only the verified Mainnet LaunchLab program
+and its four known swap discriminators, requires account index 4 to match a V15
+LaunchLab target, rejects failed transactions, and derives price only from an
+unambiguous pair of pre/post token-balance deltas. For each mint exactly two
+token-account balances must change by equal and opposite raw amounts with known
+decimals. The resulting price is `(quote raw / 10^quote_decimals) / (base raw /
+10^base_decimals)`. Wrong programs, missing decimals, zero amounts, unknown
+targets, multiple swaps, and extra relevant balance movements are rejected.
+
+```bash
+cargo run -p research -- derive-prices \
+  --features ingestion/data/features_v15.jsonl \
+  --transactions path/transactions.jsonl \
+  --output research/data/derived_price_observations.jsonl
+
+# backfill accepts validated normalized CSV or derived PriceObservation JSONL
+cargo run -p research -- backfill \
+  --features ingestion/data/features_v15.jsonl \
+  --prices research/data/derived_price_observations.jsonl
+```
+
+Historical RPC acquisition is intentionally not automated: this repository has
+no verified provider contract for historical signatures and transactions. Export
+transactions through a separately audited, read-only process, then derive and
+validate locally. No price is fabricated when that export is unavailable.
+
+`paper-trade` is a deterministic simulation only: it has no wallet, signer,
+RPC, order submission, leverage, or borrowing code. It accepts clean labeled
+samples that meet a fixed score threshold, uses one of the already-labeled
+1m/5m/15m/1h horizons, applies configured entry/exit fee and slippage, writes
+JSONL trades plus metrics, and rewrites those outputs deterministically.
+
+```bash
+cargo run -p research -- paper-trade \
+  --features research/data/labeled_launches.jsonl \
+  --score-threshold 60 --holding-seconds 300 \
+  --starting-capital 10000 --position-size 100 \
+  --fee-per-side 0.003 --slippage-per-side 0.005
+```
+
+The CLI prints `PAPER SIMULATION ONLY — NO LIVE TRADES`. Tiny samples are
+exploratory only; the backtest stays chronological and uses no random shuffle.
+
 ## Phase 2 / P3 — Real Dataset Collection and Evaluation
 
 P3 makes collection progress visible without changing the V15 scanner. Run the

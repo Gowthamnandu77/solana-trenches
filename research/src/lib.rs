@@ -1,3 +1,6 @@
+pub mod derive;
+pub mod paper;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -79,6 +82,23 @@ pub fn parse_features<R: BufRead>(reader: R) -> io::Result<Vec<Value>> {
             continue;
         }
         rows.push(value);
+    }
+    Ok(rows)
+}
+
+pub fn read_jsonl_values<R: BufRead>(reader: R, kind: &str) -> io::Result<Vec<Value>> {
+    let mut rows = Vec::new();
+    for (line_no, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        rows.push(serde_json::from_str(&line).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{kind} line {}: {e}", line_no + 1),
+            )
+        })?);
     }
     Ok(rows)
 }
@@ -306,7 +326,7 @@ pub fn quality_decision(value: &Value) -> QualityDecision {
     }
 }
 
-fn timestamp(value: &Value) -> Option<i64> {
+pub(crate) fn timestamp(value: &Value) -> Option<i64> {
     value["block_time"]
         .as_i64()
         .or_else(|| value["creation_time_unix"].as_i64())
@@ -553,6 +573,15 @@ pub fn write_observations(path: &Path, rows: &[PriceObservation]) -> io::Result<
     Ok(())
 }
 
+pub fn write_serialized_jsonl<T: Serialize>(path: &Path, rows: &[T]) -> io::Result<()> {
+    let mut file = File::create(path)?;
+    for row in rows {
+        serde_json::to_writer(&mut file, row).map_err(io::Error::other)?;
+        file.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DatasetInventory {
     pub total_feature_records: usize,
@@ -693,11 +722,12 @@ fn strategy_result(
 
 pub fn backtest(rows: &[LabeledLaunch], fee: f64, slippage: f64) -> BacktestReport {
     let labeled: Vec<_> = rows.iter().filter(|r| r.outcome.label_available).collect();
-    let usable: Vec<_> = labeled
+    let mut usable: Vec<_> = labeled
         .iter()
         .filter(|r| quality_decision(&r.features) == QualityDecision::Accept)
         .copied()
         .collect();
+    usable.sort_by_key(|row| row.creation_time_unix);
     let mut buckets = BTreeMap::new();
     let mut grouped: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     for row in &usable {
@@ -893,6 +923,153 @@ mod tests {
     use super::*;
     fn feature() -> Value {
         serde_json::json!({"schema_version":15,"protocol":"raydium_cpmm","launch_account":"pool","base_mint":"base","quote_mint":"quote","block_time":1000,"momentum_score":42.0,"approximate_unique_fee_payers_10_30_60s":[1,2,3],"transaction_acceleration_10_30_60s":[0.0,0.0,0.5],"quality_flags":{"complete_window":true,"scanner_drop_observed":false,"stale_event_observed":false,"rpc_rate_limited":false,"partial_protocol_coverage":false}})
+    }
+
+    fn launchlab_feature() -> Value {
+        serde_json::json!({"schema_version":15,"protocol":"raydium_launchlab","launch_account":"launch","base_mint":"base","quote_mint":"quote","block_time":1000,"momentum_score":80.0,"complete_window":true,"approximate_unique_fee_payers_10_30_60s":[1,2,3],"transaction_acceleration_10_30_60s":[0.0,0.0,0.5],"quality_flags":{"complete_window":true,"scanner_drop_observed":false,"stale_event_observed":false,"rpc_rate_limited":false,"partial_protocol_coverage":false}})
+    }
+
+    fn token_balance(index: u64, mint: &str, amount: &str) -> Value {
+        serde_json::json!({"accountIndex":index,"mint":mint,"uiTokenAmount":{"amount":amount,"decimals":6}})
+    }
+
+    fn launchlab_transaction(program: &str, launch: &str) -> Value {
+        let data = bs58::encode([250, 234, 13, 123, 213, 156, 19, 236]).into_string();
+        serde_json::json!({
+            "slot":7,"blockTime":1060,
+            "transaction":{"message":{"accountKeys":["payer","base_user","base_vault","quote_user","quote_vault","launch"],"instructions":[{"programId":program,"accounts":["payer","a","b","c",launch],"data":data}]}},
+            "meta":{"err":null,
+                "preTokenBalances":[token_balance(1,"base","2000000"),token_balance(2,"base","0"),token_balance(3,"quote","0"),token_balance(4,"quote","10000000")],
+                "postTokenBalances":[token_balance(1,"base","0"),token_balance(2,"base","2000000"),token_balance(3,"quote","10000000"),token_balance(4,"quote","0")]}
+        })
+    }
+
+    #[test]
+    fn derives_launchlab_price_from_verified_balance_deltas() {
+        let transaction =
+            launchlab_transaction("LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj", "launch");
+        let (observations, summary) = derive::derive_prices(&[launchlab_feature()], &[transaction]);
+        assert_eq!(summary.transactions_read, 1);
+        assert_eq!(summary.unique_observations, 1);
+        assert_eq!(observations[0].slot, Some(7));
+        assert_eq!(observations[0].timestamp_unix, 1060);
+        assert!((observations[0].price_quote_per_base - 5.0).abs() < 1e-12);
+        assert_eq!(
+            observations[0].source_quality,
+            "verified_launchlab_balance_deltas"
+        );
+    }
+
+    #[test]
+    fn derivation_rejects_wrong_failed_unknown_missing_zero_and_ambiguous_transactions() {
+        let program = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj";
+        let wrong = launchlab_transaction("unrelated", "launch");
+        let (_, summary) = derive::derive_prices(&[launchlab_feature()], &[wrong]);
+        assert_eq!(summary.observations_produced, 0);
+
+        let mut failed = launchlab_transaction(program, "launch");
+        failed["meta"]["err"] = serde_json::json!("failed");
+        assert_eq!(
+            derive::derive_prices(&[launchlab_feature()], &[failed])
+                .0
+                .len(),
+            0
+        );
+
+        let unknown = launchlab_transaction(program, "unknown");
+        assert_eq!(
+            derive::derive_prices(&[launchlab_feature()], &[unknown])
+                .1
+                .rejected_unknown_target,
+            1
+        );
+
+        let mut missing_decimals = launchlab_transaction(program, "launch");
+        missing_decimals["meta"]["preTokenBalances"][0]["uiTokenAmount"]
+            .as_object_mut()
+            .unwrap()
+            .remove("decimals");
+        assert_eq!(
+            derive::derive_prices(&[launchlab_feature()], &[missing_decimals])
+                .1
+                .rejected_malformed,
+            1
+        );
+
+        let mut zero = launchlab_transaction(program, "launch");
+        zero["meta"]["postTokenBalances"] = zero["meta"]["preTokenBalances"].clone();
+        assert_eq!(
+            derive::derive_prices(&[launchlab_feature()], &[zero])
+                .1
+                .rejected_ambiguous,
+            1
+        );
+
+        let mut ambiguous = launchlab_transaction(program, "launch");
+        ambiguous["meta"]["preTokenBalances"]
+            .as_array_mut()
+            .unwrap()
+            .push(token_balance(8, "base", "1"));
+        ambiguous["meta"]["postTokenBalances"]
+            .as_array_mut()
+            .unwrap()
+            .push(token_balance(8, "base", "2"));
+        assert_eq!(
+            derive::derive_prices(&[launchlab_feature()], &[ambiguous])
+                .1
+                .rejected_ambiguous,
+            1
+        );
+    }
+
+    #[test]
+    fn derivation_deduplicates_same_launch_timestamp() {
+        let transaction =
+            launchlab_transaction("LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj", "launch");
+        let (observations, summary) =
+            derive::derive_prices(&[launchlab_feature()], &[transaction.clone(), transaction]);
+        assert_eq!(summary.observations_produced, 2);
+        assert_eq!(summary.unique_observations, 1);
+        assert_eq!(observations.len(), 1);
+    }
+
+    #[test]
+    fn paper_simulation_is_costed_quality_gated_and_idempotent() {
+        let mut accepted = make_labeled(feature(), &[]);
+        accepted.outcome.return_5m = Some(0.1);
+        let config = paper::PaperConfig {
+            strategy_version: "test".into(),
+            score_threshold: 40.0,
+            holding_seconds: 300,
+            starting_capital: 1_000.0,
+            position_size: 100.0,
+            fee_per_side: 0.01,
+            slippage_per_side: 0.0,
+        };
+        let (trades, metrics) =
+            paper::simulate(&[accepted.clone(), accepted.clone()], &config).unwrap();
+        assert_eq!(trades.len(), 1);
+        assert!((trades[0].gross_return - 0.1).abs() < 1e-12);
+        assert!(trades[0].net_return < trades[0].gross_return);
+        assert!(
+            (metrics.ending_capital - (1_000.0 + 100.0 * net_return(0.1, 0.01, 0.0))).abs() < 1e-12
+        );
+
+        let mut rejected = accepted.clone();
+        rejected.features["quality_flags"]["stale_event_observed"] = true.into();
+        let (_, rejected_metrics) = paper::simulate(&[rejected], &config).unwrap();
+        assert_eq!(rejected_metrics.trades, 0);
+        let mut below = accepted;
+        below.momentum_score = 39.0;
+        let (_, below_metrics) = paper::simulate(&[below], &config).unwrap();
+        assert_eq!(below_metrics.trades, 0);
+
+        let mut non_finite = config;
+        non_finite.score_threshold = f64::NAN;
+        assert!(matches!(
+            paper::simulate(&[], &non_finite),
+            Err(paper::PaperConfigError::NonFinite("score_threshold"))
+        ));
     }
     #[test]
     fn parses_and_filters_features() {
