@@ -439,14 +439,25 @@ credential, provider-specific schema, interpolation, or fabricated price is
 hidden in the research crate. Rows without enough future observations remain
 `missing` or `partial` with an explicit reason.
 
-Backfill is resumable at the dataset boundary: the price CSV/JSONL cache can be
-reused after interruption, feature accounts are deduplicated, and the labeled
-JSONL is rewritten in logical content on each run rather than appended, so
-rerunning does not duplicate completed samples.
+`backfill` requires an externally acquired CSV with normalized columns:
+`protocol,launch_account,base_mint,quote_mint,timestamp_unix,slot,price_quote_per_base,source,source_quality`.
+It loads the existing observation cache when present, merges it with the CSV,
+sorts and deduplicates by launch account plus timestamp, then rewrites
+`research/data/price_observations.jsonl` and
+`research/data/labeled_launches.jsonl`. Reimporting the same CSV is idempotent:
+it does not duplicate observations, labels, or ordering. The tool never
+fabricates prices.
 
 ```bash
-cargo run -p research -- backfill --features ingestion/data/features_v15.jsonl
-cargo run -p research -- backfill --features path/features_v15.jsonl --prices path/prices.csv
+cargo run -p research -- backfill \
+  --features ingestion/data/features_v15.jsonl \
+  --prices path/prices.csv
+
+cargo run -p research -- backfill \
+  --features path/features_v15.jsonl \
+  --prices path/prices.csv \
+  --observations research/data/price_observations.jsonl \
+  --output research/data/labeled_launches.jsonl
 ```
 
 Labels use the first observation at or after creation as the reference price,

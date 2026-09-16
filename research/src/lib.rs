@@ -159,12 +159,40 @@ pub fn read_prices<R: BufRead>(reader: R) -> io::Result<Vec<PriceObservation>> {
         };
         points.push(normalized);
     }
+    Ok(normalize_observations(points))
+}
+
+pub fn read_observations<R: BufRead>(reader: R) -> io::Result<Vec<PriceObservation>> {
+    let mut points = Vec::new();
+    for (line_no, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        points.push(serde_json::from_str(&line).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("observation line {}: {e}", line_no + 1),
+            )
+        })?);
+    }
+    Ok(normalize_observations(points))
+}
+
+pub fn merge_observations(
+    existing: Vec<PriceObservation>,
+    imported: Vec<PriceObservation>,
+) -> Vec<PriceObservation> {
+    normalize_observations(existing.into_iter().chain(imported).collect())
+}
+
+pub fn normalize_observations(mut points: Vec<PriceObservation>) -> Vec<PriceObservation> {
     points.retain(|p| p.price_quote_per_base.is_finite() && p.price_quote_per_base > 0.0);
     points.sort_by_key(|p| (p.launch_account.clone(), p.timestamp_unix));
     points.dedup_by(|a, b| {
         a.launch_account == b.launch_account && a.timestamp_unix == b.timestamp_unix
     });
-    Ok(points)
+    points
 }
 
 fn invalid_price<E: std::fmt::Display>(e: E) -> io::Error {
@@ -784,6 +812,51 @@ mod tests {
         assert_eq!(rows[0].slot, Some(7));
         assert!(rows[0].derived_from_swaps);
     }
+
+    #[test]
+    fn observation_cache_merge_is_sorted_and_idempotent() {
+        let path = std::env::temp_dir().join(format!(
+            "trenches-observations-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let existing = vec![PriceObservation {
+            protocol: "raydium_cpmm".into(),
+            launch_account: "pool".into(),
+            base_mint: Some("base".into()),
+            quote_mint: Some("quote".into()),
+            timestamp_unix: 1000,
+            slot: Some(1),
+            price_quote_per_base: 10.0,
+            source: "cached_fixture".into(),
+            source_quality: "observed".into(),
+            observed: true,
+            derived_from_swaps: false,
+        }];
+        write_observations(&path, &existing).unwrap();
+        let cached = read_observations(BufReader::new(File::open(&path).unwrap())).unwrap();
+        let imported = read_prices("protocol,launch_account,base_mint,quote_mint,timestamp_unix,slot,price_quote_per_base,source,source_quality\n\
+raydium_cpmm,pool,base,quote,1060,2,11.0,imported_fixture,observed\n\
+raydium_cpmm,pool,base,quote,1000,1,99.0,imported_fixture,observed\n".as_bytes()).unwrap();
+
+        let merged = merge_observations(cached, imported.clone());
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].timestamp_unix, 1000);
+        assert_eq!(merged[0].price_quote_per_base, 10.0);
+        assert_eq!(merged[1].timestamp_unix, 1060);
+
+        let repeated = merge_observations(merged.clone(), imported);
+        assert_eq!(
+            serde_json::to_string(&repeated).unwrap(),
+            serde_json::to_string(&merged).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string(&make_labeled(feature(), &repeated)).unwrap(),
+            serde_json::to_string(&make_labeled(feature(), &merged)).unwrap()
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn labels_only_observations_at_or_before_horizons() {
         let prices = vec![
@@ -833,6 +906,34 @@ mod tests {
         assert!((outcome.max_return_5m.unwrap() - 0.2).abs() < 1e-12);
         assert!((outcome.max_drawdown_5m.unwrap() + 0.3).abs() < 1e-12);
     }
+
+    #[test]
+    fn feature_prices_label_and_backtest_form_one_complete_flow() {
+        let csv = "protocol,launch_account,base_mint,quote_mint,timestamp_unix,slot,price_quote_per_base,source,source_quality\n\
+raydium_cpmm,pool,base,quote,1000,1,100.0,fixture,observed\n\
+raydium_cpmm,pool,base,quote,1060,2,110.0,fixture,observed\n\
+raydium_cpmm,pool,base,quote,1300,3,120.0,fixture,observed\n\
+raydium_cpmm,pool,base,quote,1900,4,90.0,fixture,observed\n\
+raydium_cpmm,pool,base,quote,4600,5,150.0,fixture,observed\n";
+        let prices = read_prices(csv.as_bytes()).unwrap();
+        let labeled = make_labeled(feature(), &prices);
+
+        assert_eq!(labeled.outcome.label_status, "complete");
+        assert!((labeled.outcome.return_1m.unwrap() - 0.10).abs() < 1e-12);
+        assert!((labeled.outcome.return_5m.unwrap() - 0.20).abs() < 1e-12);
+        assert!((labeled.outcome.return_15m.unwrap() + 0.10).abs() < 1e-12);
+        assert!((labeled.outcome.return_1h.unwrap() - 0.50).abs() < 1e-12);
+
+        let report = backtest(&[labeled], 0.0, 0.0);
+        assert_eq!(report.dataset_size, 1);
+        assert_eq!(report.complete_samples, 1);
+        assert_eq!(report.chronological_train_samples, 1);
+        assert_eq!(report.chronological_holdout_samples, 0);
+        let bucket = &report.return_5m_by_score_bucket["40-60"];
+        assert_eq!(bucket.signals, 1);
+        assert!((bucket.average_return.unwrap() - 0.20).abs() < 1e-12);
+    }
+
     #[test]
     fn bucketing_and_strategies_are_deterministic() {
         let f = feature();
