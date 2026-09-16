@@ -88,6 +88,10 @@ fn derive_one(
     }
     let slot = tx["slot"].as_u64().ok_or(Reject::Malformed)?;
     let timestamp_unix = tx["blockTime"].as_i64().ok_or(Reject::Malformed)?;
+    let source_tx_signature = tx
+        .pointer("/transaction/signatures/0")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let account_keys = account_keys(tx).ok_or(Reject::Malformed)?;
     let swaps: Vec<_> = instructions(tx)
         .filter_map(|instruction| launchlab_swap(instruction, &account_keys))
@@ -121,6 +125,7 @@ fn derive_one(
         price_quote_per_base,
         source: "solana_transaction_export".into(),
         source_quality: "verified_launchlab_balance_deltas".into(),
+        source_tx_signature,
         observed: true,
         derived_from_swaps: true,
     }))

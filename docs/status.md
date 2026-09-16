@@ -4,7 +4,8 @@
 
 - V15 Raydium ingestion, bounded freshness, decoding, feature persistence, and tests.
 - Offline price export validation, cache, horizon-aware labels, chronological backtest.
-- Offline LaunchLab transaction-export derivation with fail-closed validation.
+- Offline LaunchLab transaction-export derivation with fail-closed validation
+  and optional transaction-signature provenance.
 - Paper-only deterministic simulation with costs and JSONL persistence.
 
 ## Blocked by external data

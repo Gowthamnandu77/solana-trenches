@@ -16,6 +16,8 @@ Historical extraction fails closed. A LaunchLab price requires a successful
 exported transaction, a verified program/discriminator/account layout, known
 target mints/decimals, and unambiguous equal-and-opposite balance deltas. This
 protects the research path from guessed prices and unrelated token movements.
+Derived observations retain an optional source transaction signature for audit
+traceability to the local export.
 
 Quality flags preserve scanner evidence. Process-wide rate limiting is not
 reinterpreted as per-launch completeness without additional evidence.

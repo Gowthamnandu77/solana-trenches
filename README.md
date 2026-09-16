@@ -493,6 +493,9 @@ token-account balances must change by equal and opposite raw amounts with known
 decimals. The resulting price is `(quote raw / 10^quote_decimals) / (base raw /
 10^base_decimals)`. Wrong programs, missing decimals, zero amounts, unknown
 targets, multiple swaps, and extra relevant balance movements are rejected.
+Derived observations preserve an optional `source_tx_signature`; older CSV and
+JSONL observations remain readable without it. Inventory reports per-horizon
+label coverage and backtest-eligible labels in addition to feature readiness.
 
 ```bash
 cargo run -p research -- derive-prices \
@@ -510,6 +513,11 @@ Historical RPC acquisition is intentionally not automated: this repository has
 no verified provider contract for historical signatures and transactions. Export
 transactions through a separately audited, read-only process, then derive and
 validate locally. No price is fabricated when that export is unavailable.
+
+`rpc_rate_limited` remains a conservative process-wide scanner flag: it means a
+rate limit occurred during the process, not that a particular launch is proven
+incomplete. The research quality gate therefore continues to reject it until
+per-launch fetch-completeness evidence exists.
 
 `paper-trade` is a deterministic simulation only: it has no wallet, signer,
 RPC, order submission, leverage, or borrowing code. It accepts clean labeled

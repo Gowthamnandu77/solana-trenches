@@ -22,6 +22,8 @@ pub struct PriceObservation {
     pub price_quote_per_base: f64,
     pub source: String,
     pub source_quality: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tx_signature: Option<String>,
     pub observed: bool,
     pub derived_from_swaps: bool,
 }
@@ -176,6 +178,7 @@ fn read_price_csv<R: BufRead>(
                 price_quote_per_base: fields[6].parse().map_err(invalid_price)?,
                 source: fields[7].into(),
                 source_quality: fields[8].into(),
+                source_tx_signature: None,
                 observed: true,
                 derived_from_swaps: fields[8].contains("swap"),
             }
@@ -190,6 +193,7 @@ fn read_price_csv<R: BufRead>(
                 price_quote_per_base: fields[2].parse().map_err(invalid_price)?,
                 source: fields[3].into(),
                 source_quality: "unverified_import".into(),
+                source_tx_signature: None,
                 observed: true,
                 derived_from_swaps: false,
             }
@@ -592,9 +596,15 @@ pub struct DatasetInventory {
     pub scanner_quality_flag_counts: BTreeMap<String, usize>,
     pub records_with_usable_mints: usize,
     pub records_ready_for_labeling: usize,
+    pub labels_with_1m: usize,
+    pub labels_with_5m: usize,
+    pub labels_with_15m: usize,
+    pub labels_with_1h: usize,
     pub labeled: usize,
     pub partially_labeled: usize,
     pub unlabeled: usize,
+    pub quality_accepted_labels: usize,
+    pub backtest_eligible: usize,
 }
 
 pub fn inventory(features: &[Value], labels: Option<&[LabeledLaunch]>) -> DatasetInventory {
@@ -650,6 +660,14 @@ pub fn inventory(features: &[Value], labels: Option<&[LabeledLaunch]>) -> Datase
     result.unique_launch_accounts = accounts.len();
     if let Some(labels) = labels {
         for row in labels {
+            result.labels_with_1m += row.outcome.return_1m.is_some() as usize;
+            result.labels_with_5m += row.outcome.return_5m.is_some() as usize;
+            result.labels_with_15m += row.outcome.return_15m.is_some() as usize;
+            result.labels_with_1h += row.outcome.return_1h.is_some() as usize;
+            if quality_decision(&row.features) == QualityDecision::Accept {
+                result.quality_accepted_labels += 1;
+                result.backtest_eligible += row.outcome.label_available as usize;
+            }
             match row.outcome.label_status.as_str() {
                 "complete" => result.labeled += 1,
                 "partial" => result.partially_labeled += 1,
@@ -937,7 +955,7 @@ mod tests {
         let data = bs58::encode([250, 234, 13, 123, 213, 156, 19, 236]).into_string();
         serde_json::json!({
             "slot":7,"blockTime":1060,
-            "transaction":{"message":{"accountKeys":["payer","base_user","base_vault","quote_user","quote_vault","launch"],"instructions":[{"programId":program,"accounts":["payer","a","b","c",launch],"data":data}]}},
+            "transaction":{"signatures":["fixture_signature"],"message":{"accountKeys":["payer","base_user","base_vault","quote_user","quote_vault","launch"],"instructions":[{"programId":program,"accounts":["payer","a","b","c",launch],"data":data}]}},
             "meta":{"err":null,
                 "preTokenBalances":[token_balance(1,"base","2000000"),token_balance(2,"base","0"),token_balance(3,"quote","0"),token_balance(4,"quote","10000000")],
                 "postTokenBalances":[token_balance(1,"base","0"),token_balance(2,"base","2000000"),token_balance(3,"quote","10000000"),token_balance(4,"quote","0")]}
@@ -957,6 +975,10 @@ mod tests {
         assert_eq!(
             observations[0].source_quality,
             "verified_launchlab_balance_deltas"
+        );
+        assert_eq!(
+            observations[0].source_tx_signature.as_deref(),
+            Some("fixture_signature")
         );
     }
 
@@ -1103,6 +1125,7 @@ mod tests {
             price_quote_per_base: 10.0,
             source: "cached_fixture".into(),
             source_quality: "observed".into(),
+            source_tx_signature: None,
             observed: true,
             derived_from_swaps: false,
         }];
@@ -1165,6 +1188,7 @@ raydium_cpmm,pool,base,quote,4600,5,150.0,verified_fixture,observed\n";
             price_quote_per_base: 10.0,
             source: "fixture".into(),
             source_quality: "observed".into(),
+            source_tx_signature: None,
             observed: true,
             derived_from_swaps: false,
         };
@@ -1198,6 +1222,7 @@ raydium_cpmm,pool,base,quote,4600,5,150.0,verified_fixture,observed\n";
                 price_quote_per_base: 10.0,
                 source: "onchain_fixture".into(),
                 source_quality: "derived_from_swaps".into(),
+                source_tx_signature: None,
                 observed: true,
                 derived_from_swaps: true,
             },
@@ -1211,6 +1236,7 @@ raydium_cpmm,pool,base,quote,4600,5,150.0,verified_fixture,observed\n";
                 price_quote_per_base: 12.0,
                 source: "onchain_fixture".into(),
                 source_quality: "derived_from_swaps".into(),
+                source_tx_signature: None,
                 observed: true,
                 derived_from_swaps: true,
             },
@@ -1224,6 +1250,7 @@ raydium_cpmm,pool,base,quote,4600,5,150.0,verified_fixture,observed\n";
                 price_quote_per_base: 9.0,
                 source: "onchain_fixture".into(),
                 source_quality: "derived_from_swaps".into(),
+                source_tx_signature: None,
                 observed: true,
                 derived_from_swaps: true,
             },
