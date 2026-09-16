@@ -416,10 +416,10 @@ chronological train/test split should be added only after enough timestamped
 launches exist.
 
 Metrics are gross and unadjusted: fees, slippage, latency, and execution are not
-modeled. The current repository contains no labeled historical samples, so it
-cannot support a predictive or profitability conclusion. The largest remaining
-limitation is obtaining a sufficiently complete, independently verified,
-timestamp-aligned on-chain price history across all supported pool types.
+modeled. The current real export is exploratory: 35 unique observations across
+the ten LaunchLab targets produce two 1m labels, one 5m label, one 15m label,
+and no 1h label. This is not enough for a predictive or profitability
+conclusion.
 
 ## Phase 2 / P2 — Historical Data Acquisition
 
@@ -487,12 +487,12 @@ offline reproducibility and source auditability take priority.
 `derive-prices` is an offline, fail-closed adapter for locally exported Solana
 transaction JSONL. It recognizes only the verified Mainnet LaunchLab program
 and its four known swap discriminators, requires account index 4 to match a V15
-LaunchLab target, rejects failed transactions, and derives price only from an
-unambiguous pair of pre/post token-balance deltas. For each mint exactly two
-token-account balances must change by equal and opposite raw amounts with known
-decimals. The resulting price is `(quote raw / 10^quote_decimals) / (base raw /
-10^base_decimals)`. Wrong programs, missing decimals, zero amounts, unknown
-targets, multiple swaps, and extra relevant balance movements are rejected.
+LaunchLab target, rejects failed transactions, and derives price from either
+instruction-scoped `transferChecked` movements or the owner-scoped balance
+fallback. Exact-in input amounts, mints, decimals, and uniquely attributable
+principal transfers must agree; ties, multiple swaps, unknown targets, and
+unrelated movements are rejected. The resulting price is
+`(quote raw / 10^quote_decimals) / (base raw / 10^base_decimals)`.
 Derived observations preserve an optional `source_tx_signature`; older CSV and
 JSONL observations remain readable without it. Inventory reports per-horizon
 label coverage and backtest-eligible labels in addition to feature readiness.
@@ -509,10 +509,10 @@ cargo run -p research -- backfill \
   --prices research/data/derived_price_observations.jsonl
 ```
 
-Historical RPC acquisition is intentionally not automated: this repository has
-no verified provider contract for historical signatures and transactions. Export
-transactions through a separately audited, read-only process, then derive and
-validate locally. No price is fabricated when that export is unavailable.
+`fetch-transactions` performs bounded, read-only archive-RPC acquisition for a
+target's creation-to-+1h window. Raw exports remain local and ignored; every
+derived observation retains its source transaction signature. No price is
+fabricated when a transaction is unavailable or attribution is ambiguous.
 
 `rpc_rate_limited` remains a conservative process-wide scanner flag: it means a
 rate limit occurred during the process, not that a particular launch is proven
@@ -535,8 +535,9 @@ cargo run -p research -- paper-trade \
 
 The CLI prints `PAPER SIMULATION ONLY — NO LIVE TRADES`. Tiny samples are
 exploratory only; the backtest stays chronological and uses no random shuffle.
-The repository currently has no real historical observations or labels, so it
-does not make a real backtest or paper-simulation performance claim.
+The current real sample is below the quality gate because all V15 rows retain
+conservative scanner warnings (`rpc_rate_limited` and approximate identity), so
+no real backtest or paper-simulation performance claim is made.
 
 ## Phase 2 / P3 — Real Dataset Collection and Evaluation
 

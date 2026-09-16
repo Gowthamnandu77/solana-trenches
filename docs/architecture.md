@@ -14,7 +14,9 @@ network or signing capability and persists only deterministic simulated trades.
 
 Historical extraction fails closed. A LaunchLab price requires a successful
 exported transaction, a verified program/discriminator/account layout, known
-target mints/decimals, and unambiguous equal-and-opposite balance deltas. This
+target mints/decimals, and unambiguous instruction-scoped token transfers (with
+an owner-scoped balance fallback). Exact-in input and principal output amounts
+must agree; fees, unrelated movements, and ambiguous routing are rejected. This
 protects the research path from guessed prices and unrelated token movements.
 Derived observations retain an optional source transaction signature for audit
 traceability to the local export.

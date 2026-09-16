@@ -10,13 +10,16 @@
 
 ## Real-data complete
 
-- None. The repository intentionally contains no fabricated historical prices,
-  labels, backtest results, or paper-simulation results.
+- Archive-RPC transaction acquisition and LaunchLab instruction-scoped price
+  derivation are verified for all ten targets.
+- 35 unique real observations are available: two 1m labels, one 5m label, and
+  one 15m label. No real 1h label exists.
 
 ## Blocked by external data
 
-- A verified historical RPC/provider contract or audited transaction export for the real ten launches.
-- Real historical observations, labels, and any meaningful performance conclusion.
+- A complete +1h market-activity series for at least one target.
+- Scanner-quality acceptance remains separate from historical price coverage;
+  all current V15 rows retain conservative rate-limit/identity warnings.
 
 ## Environment prerequisite
 
