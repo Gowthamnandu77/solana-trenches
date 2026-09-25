@@ -1,34 +1,33 @@
-# Status
+# Project status
 
-## Complete
+## Implemented and tested offline
 
-- V15 Raydium ingestion, bounded freshness, decoding, feature persistence, and tests.
-- Offline price export validation, cache, horizon-aware labels, chronological backtest.
-- Offline LaunchLab transaction-export derivation with fail-closed validation
-  and optional transaction-signature provenance.
-- Paper-only deterministic simulation with costs and JSONL persistence.
+- V15 Raydium CPMM, CLMM, and supported Mainnet LaunchLab ingestion with bounded freshness, deduplication, pacing/retries, decoding, momentum windows, persistence, and runtime metrics.
+- Offline normalized price validation/cache, horizon-aware labels, chronological backtesting, and deterministic costed paper simulation.
+- Fail-closed local LaunchLab transaction-export price derivation with optional source transaction signature provenance.
 
-## Real-data complete
+## Documented historical pilot (not live telemetry)
 
-- Archive-RPC transaction acquisition and LaunchLab instruction-scoped price
-  derivation are verified for all ten targets.
-- 35 unique real observations are available: two 1m labels, one 5m label, and
-  one 15m label. No real 1h label exists.
+The checked-in project documentation supports these historical read-only pilot facts:
 
-## Blocked by external data
+- 10 LaunchLab targets were processed.
+- 35 unique real price observations were retained.
+- Labels available: two at 1 minute, one at 5 minutes, one at 15 minutes, and none at 1 hour.
+- Zero rows were accepted by the scanner-quality backtest gate.
 
-- A complete +1h market-activity series for at least one target.
-- Scanner-quality acceptance remains separate from historical price coverage;
-  all current V15 rows retain conservative rate-limit/identity warnings.
+The repository docs currently do **not** record the 1,661-transaction or 67-verified-swap-candidate totals. They should not be presented as validated repository metrics until their source evidence is committed or documented. None of these pilot counts are current live metrics, trading performance, or evidence of alpha.
 
-## Environment prerequisite
+## Why the current data cannot support a result claim
 
-- The Anchor integration test needs `target/deploy/solana_trenches.so` from an
-  SBF build. The current build is blocked by a program-ID/keypair mismatch and
-  unavailable crate downloads; neither is changed automatically.
+No complete one-hour series exists for the pilot, so there is no 1-hour label. More importantly, historical price coverage and scanner quality are independent: current V15 rows retain conservative warnings, so they fail the quality gate even where a short-horizon price label exists. The backtest therefore has zero accepted samples. Historical paper simulation is a replay over labels; it is not live forward paper trading.
 
-## Future work
+## External limitations and next evidence needed
 
-- Provider-specific read-only export adapter after retention, rate limits, and response semantics are verified.
-- Per-launch evidence for RPC-induced incompleteness.
-- Larger chronological holdout evaluation after adequate clean labeled coverage.
+- A larger chronological sample with clean, complete scanner-quality records and sufficient future prices.
+- Per-launch evidence to distinguish process-wide rate limiting from launch-specific incompleteness.
+- A provider-specific, read-only acquisition adapter only after retention, rate limit, and response semantics are independently verified.
+- Broader protocol coverage only after verified account-layout and discriminator support is added.
+
+## Anchor workspace-test prerequisite
+
+`cargo test --workspace` includes an Anchor/LiteSVM integration test that requires `target/deploy/solana_trenches.so` from an SBF build. The existing project notes a program-ID/keypair mismatch and unavailable crate downloads as blockers; this documentation pass does not change those prerequisites or attempt to work around them. Ingestion and research tests do not require SBF artifacts or network access.
